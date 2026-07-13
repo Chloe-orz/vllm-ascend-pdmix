@@ -594,7 +594,10 @@ class PassiveEngineCoreProc:
             if batch.scheduler_output.batch_type == BatchType.DECODE_FIRST:
                 self._maybe_publish_post_out(batch.scheduler_output)
             elif (
-                batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
+                batch.scheduler_output.batch_type in (
+                    BatchType.PREFILL_FIRST,
+                    BatchType.MTP_DRAFT_FIRST,
+                )
                 and (slice_info is None or slice_info.is_last_slice)
             ):
                 head_token = getattr(batch.scheduler_output, "head_token", None)
@@ -613,6 +616,7 @@ class PassiveEngineCoreProc:
         Mapping (cloud-side):
             PREFILL_FIRST → PREFILL_LAST
             DECODE_FIRST  → DECODE_LAST
+            MTP_DRAFT_FIRST → MTP_DRAFT_LAST
             anything else → dropped (legacy PP batches don't trigger return)
 
         Uses a shallow copy via :py:func:`dataclasses.replace` so the original
@@ -630,6 +634,10 @@ class PassiveEngineCoreProc:
         elif bt == BatchType.DECODE_FIRST:
             tail = replace(
                 scheduler_output, batch_type=BatchType.DECODE_LAST
+            )
+        elif bt == BatchType.MTP_DRAFT_FIRST:
+            tail = replace(
+                scheduler_output, batch_type=BatchType.MTP_DRAFT_LAST
             )
         else:
             return

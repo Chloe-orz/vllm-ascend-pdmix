@@ -583,6 +583,10 @@ class NPUWorker(WorkerBase):
         if self.model_runner._edge_cloud_enabled:
             bt = scheduler_output.batch_type
             if is_cloud_device():
+                if bt == BatchType.MTP_DRAFT_FIRST:
+                    return self._execute_model_cloud_mtp(
+                        scheduler_output, layer_slice_info
+                    )
                 return self._execute_model_cloud(
                     scheduler_output, layer_slice_info
                 )
@@ -793,6 +797,25 @@ class NPUWorker(WorkerBase):
             )
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output
+
+    def _execute_model_cloud_mtp(
+        self,
+        scheduler_output: "SchedulerOutput",
+        layer_slice_info: Any,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        """Cloud Qwen-MTP middle segment for one draft step."""
+        logger.info(
+            "Execute MTP draft middle, batch_type=%s, task_id=%s, step=%s",
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "mtp_draft_task_id", None),
+            getattr(scheduler_output, "draft_step_idx", None),
+        )
+        self.model_runner._run_mtp_cloud_segment()
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        )
 
     def _execute_model_legacy(
         self,

@@ -97,6 +97,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import copy_num_valid_draft_tokens
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -1046,6 +1047,367 @@ class NPUModelRunner(GPUModelRunner):
             self.num_layers,
             self.edge_cloud_cfg.role,
         )
+
+        if self.drafter is not None:
+            logger.info("[EdgeCloud] Loading drafter model...")
+            if self.vllm_config.quant_config is not None:
+                patch_load_weights(self.vllm_config)
+
+            is_mtp_drafter = (
+                self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+            )
+            if is_mtp_drafter:
+                # Qwen-MTP draft layers are split explicitly by
+                # _setup_edge_cloud_mtp(); use 0/0 here so model construction
+                # does not keep main-model head/tail ranges for the drafter.
+                from vllm.distributed.parallel_state import set_edge_cloud_layer_range
+                set_edge_cloud_layer_range(0, 0)
+
+            with get_tp_context(self.drafter):
+                self.drafter.load_model(self.model)
+
+            if (
+                is_mtp_drafter
+                and hasattr(self.drafter, "model")
+                and self.drafter.model is not None
+            ):
+                self._setup_edge_cloud_mtp(self.drafter.model)
+
+    def _get_mtp_predictor(self, mtp_model: nn.Module) -> nn.Module | None:
+        """Locate the predictor module inside an MTP draft model."""
+        if hasattr(mtp_model, "model"):
+            inner = mtp_model.model
+            if hasattr(inner, "layers") and hasattr(inner, "embed_tokens"):
+                return inner
+        if hasattr(mtp_model, "layers") and hasattr(mtp_model, "embed_tokens"):
+            return mtp_model
+        return None
+
+    def _clean_mtp_compilation_config(
+        self,
+        mtp_model: nn.Module,
+        mtp_module_ids: set[int],
+    ) -> None:
+        """Drop stale static forward-context entries after MTP sharding."""
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config is None:
+            return
+
+        current_mtp_module_ids = {
+            id(module) for _, module in mtp_model.named_modules()
+        }
+        removed_prefixes: list[str] = []
+        for prefix in list(compilation_config.static_forward_context.keys()):
+            module = compilation_config.static_forward_context[prefix]
+            if (
+                id(module) in mtp_module_ids
+                and id(module) not in current_mtp_module_ids
+            ):
+                del compilation_config.static_forward_context[prefix]
+                removed_prefixes.append(prefix)
+
+        if removed_prefixes:
+            logger.info(
+                "[EdgeCloud] MTP removed %d stale static_forward_context "
+                "entries: %s",
+                len(removed_prefixes),
+                removed_prefixes,
+            )
+
+        if hasattr(compilation_config, "static_all_moe_layers"):
+            compilation_config.static_all_moe_layers[:] = [
+                prefix
+                for prefix in compilation_config.static_all_moe_layers
+                if prefix not in removed_prefixes
+            ]
+
+    def _setup_edge_cloud_mtp(self, mtp_model: nn.Module) -> None:
+        predictor = self._get_mtp_predictor(mtp_model)
+        if predictor is None:
+            logger.warning("[EdgeCloud] Cannot find MTP predictor for sharding")
+            return
+
+        from vllm.distributed.parallel_state import get_edge_cloud_layer_range
+
+        num_mtp_layers = len(predictor.layers)
+        mtp_module_ids = {id(module) for _, module in mtp_model.named_modules()}
+        head_k, tail_k = get_edge_cloud_layer_range()
+
+        local_layers: set[int] = set()
+        if is_edge_device():
+            if head_k > 0:
+                local_layers.update(range(head_k))
+            if tail_k > 0:
+                local_layers.update(range(num_mtp_layers - tail_k, num_mtp_layers))
+        else:
+            local_layers.update(range(head_k, num_mtp_layers - tail_k))
+
+        layer_keys = (
+            list(predictor.layers.keys())
+            if isinstance(predictor.layers, nn.ModuleDict)
+            else list(range(num_mtp_layers))
+        )
+        for idx, key in enumerate(layer_keys):
+            if idx not in local_layers and not isinstance(
+                predictor.layers[key], PPMissingLayer
+            ):
+                predictor.layers[key] = PPMissingLayer()
+
+        # Cloud side only owns MTP decoder-layer execution; edge owns
+        # embedding/fc/norm/lm_head for draft token generation.
+        if not is_edge_device():
+            for module_name in (
+                "embed_tokens",
+                "fc",
+                "norm",
+                "pre_fc_norm_hidden",
+                "pre_fc_norm_embedding",
+            ):
+                module = getattr(predictor, module_name, None)
+                if module is not None and not isinstance(module, PPMissingLayer):
+                    setattr(predictor, module_name, PPMissingLayer())
+            if (
+                hasattr(mtp_model, "lm_head")
+                and not isinstance(mtp_model.lm_head, PPMissingLayer)
+            ):
+                mtp_model.lm_head = PPMissingLayer()
+
+        if hasattr(mtp_model, "set_moe_parameters"):
+            mtp_model.set_moe_parameters()
+
+        self._clean_mtp_compilation_config(mtp_model, mtp_module_ids)
+
+        if hasattr(self, "_edge_cloud_mtp_segments"):
+            delattr(self, "_edge_cloud_mtp_segments")
+        self._edge_cloud_mtp_segments = {}
+
+        if hasattr(self, "_edge_cloud_mtp_intermediate_buffers"):
+            delattr(self, "_edge_cloud_mtp_intermediate_buffers")
+        if hasattr(predictor, "make_empty_intermediate_tensors"):
+            max_mtp_tokens = self.max_num_tokens
+            if enable_sp():
+                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                max_mtp_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+            self._edge_cloud_mtp_intermediate_buffers = (
+                predictor.make_empty_intermediate_tensors(
+                    batch_size=max_mtp_tokens,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+        else:
+            self._edge_cloud_mtp_intermediate_buffers = None
+
+        if self.edge_cloud_cfg.role == "edge":
+            seg_a = self._create_segment_callable(
+                mtp_model, 0, 0, is_first_segment=True, is_last_segment=False
+            )
+            seg_e = self._create_segment_callable(
+                mtp_model, 0, 0, is_first_segment=False, is_last_segment=True
+            )
+            self._edge_cloud_mtp_segments["a"] = self._wrap_segment_if_needed(seg_a)
+            self._edge_cloud_mtp_segments["e"] = self._wrap_segment_if_needed(seg_e)
+        else:
+            seg_c = self._create_segment_callable(
+                mtp_model, 0, 0, is_first_segment=False, is_last_segment=False
+            )
+            self._edge_cloud_mtp_segments["c"] = self._wrap_segment_if_needed(seg_c)
+
+    def _sync_edge_cloud_mtp_intermediate_tensors(
+        self,
+        num_tokens: int,
+        intermediate_tensors: IntermediateTensors,
+    ) -> IntermediateTensors:
+        """Copy received MTP tensors into stable buffers for graph replay."""
+        buffers = self._edge_cloud_mtp_intermediate_buffers
+        if buffers is None:
+            return intermediate_tensors
+
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        copy_len = (num_tokens + tp_size - 1) // tp_size if enable_sp() else num_tokens
+
+        synced: dict[str, torch.Tensor | Any] = {}
+        for key, value in intermediate_tensors.items():
+            if key not in buffers.tensors or not isinstance(value, torch.Tensor):
+                synced[key] = value
+                continue
+            dst = buffers[key][:copy_len]
+            recv_len = min(value.shape[0], copy_len)
+            if recv_len:
+                dst[:recv_len].copy_(value[:recv_len])
+            if recv_len < copy_len:
+                dst[recv_len:].zero_()
+            synced[key] = dst
+
+        return IntermediateTensors(synced)
+
+    def _build_mtp_cloud_attn_metadata(
+        self,
+        positions: torch.Tensor,
+        spec_step_idx: int,
+    ) -> dict[str, Any] | None:
+        """Build per-layer attention metadata for cloud MTP draft layers."""
+        if (
+            not hasattr(self, "_cloud_spec_decode_common_attn_metadata")
+            or self._cloud_spec_decode_common_attn_metadata is None
+        ):
+            return None
+
+        if (
+            self.drafter is None
+            or not hasattr(self.drafter, "draft_attn_groups")
+            or not self.drafter.draft_attn_groups
+        ):
+            return None
+
+        common_attn_metadata = self._cloud_spec_decode_common_attn_metadata
+        num_reqs = getattr(self, "_cloud_spec_decode_num_reqs", 0)
+        common_attn_metadata = self.drafter.shallow_copy_metadata(
+            common_attn_metadata
+        )
+        common_attn_metadata.positions = positions
+
+        batch_size = num_reqs
+        num_input_tokens = positions.shape[-1]
+        common_attn_metadata.num_actual_tokens = num_input_tokens
+        common_attn_metadata.num_input_tokens = num_input_tokens
+
+        if spec_step_idx > 0:
+            common_attn_metadata.max_query_len = 1
+            common_attn_metadata.decode_token_per_req = 1
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+            common_attn_metadata.seq_lens[:batch_size] += spec_step_idx
+            if common_attn_metadata.seq_lens_cpu is not None:
+                common_attn_metadata.seq_lens_cpu = (
+                    common_attn_metadata.seq_lens_cpu.clone()
+                )
+                common_attn_metadata.seq_lens_cpu[:batch_size] += spec_step_idx
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu = (
+                    common_attn_metadata._seq_lens_cpu.clone()
+                )
+                common_attn_metadata._seq_lens_cpu[:batch_size] += spec_step_idx
+            if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu = (
+                    common_attn_metadata.num_computed_tokens_cpu.clone()
+                )
+                common_attn_metadata.num_computed_tokens_cpu[:batch_size] += (
+                    spec_step_idx
+                )
+
+            common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+            device = common_attn_metadata.seq_lens.device
+            new_query_start_loc_cpu = torch.arange(
+                batch_size + 1, dtype=torch.int32, device="cpu"
+            )
+            common_attn_metadata.query_start_loc_cpu = new_query_start_loc_cpu
+            common_attn_metadata.query_start_loc = new_query_start_loc_cpu.to(
+                device, non_blocking=True
+            )
+            common_attn_metadata.num_actual_tokens = batch_size
+            common_attn_metadata.num_input_tokens = num_input_tokens
+            common_attn_metadata.actual_seq_lengths_q = list(
+                range(1, batch_size + 1)
+            )
+
+            block_table_tensor = common_attn_metadata.block_table_tensor
+            if (
+                block_table_tensor is not None
+                and positions is not None
+                and self.drafter is not None
+                and hasattr(self.drafter, "kernel_block_size")
+            ):
+                block_size = self.drafter.kernel_block_size
+                pos_flat = positions if positions.dim() == 1 else positions[0]
+                pos_flat = pos_flat[:batch_size]
+                exceeds = pos_flat >= self.model_config.max_model_len
+                clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
+                block_numbers = clamped // block_size
+                block_ids = block_table_tensor[:batch_size].gather(
+                    dim=1, index=block_numbers.view(-1, 1).long()
+                ).view(-1)
+                new_slot_mapping = (
+                    block_ids * block_size + clamped % block_size
+                ).to(torch.int32)
+                new_slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
+                common_attn_metadata.slot_mapping = new_slot_mapping
+        elif common_attn_metadata.attn_state is None:
+            common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+
+        per_layer_attn_metadata: dict[str, Any] = {}
+        for attn_group in self.drafter.draft_attn_groups:
+            builder = attn_group.get_metadata_builder()
+            if spec_step_idx == 0:
+                attn_meta = builder.build(0, common_attn_metadata)
+            else:
+                attn_meta = builder.build_for_drafting(
+                    common_attn_metadata=common_attn_metadata,
+                    draft_index=spec_step_idx,
+                )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_meta
+
+        return per_layer_attn_metadata
+
+    def _run_mtp_cloud_segment(self) -> None:
+        from vllm_ascend.distributed.parallel_state import (
+            edge_cloud_broadcast_recv_mtp,
+            edge_cloud_send_tensor_dict_mtp,
+        )
+
+        tensor_dict, comm_handles, comm_postprocess = (
+            edge_cloud_broadcast_recv_mtp()
+        )
+        for handle in comm_handles:
+            handle.wait()
+        for postprocess in comm_postprocess:
+            postprocess()
+
+        intermediate = IntermediateTensors(tensor_dict)
+        positions = intermediate.tensors.get("positions", None)
+        num_tokens = positions.shape[-1] if positions is not None else 0
+        intermediate = self._sync_edge_cloud_mtp_intermediate_tensors(
+            num_tokens, intermediate
+        )
+
+        model_kwargs = {
+            "intermediate_tensors": intermediate,
+            "positions": positions,
+        }
+        spec_step_idx = 0
+        if "spec_step_idx" in tensor_dict:
+            spec_step_idx = tensor_dict["spec_step_idx"].item()
+            model_kwargs["spec_step_idx"] = spec_step_idx
+
+        draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
+            positions, spec_step_idx
+        )
+        segment = self._edge_cloud_mtp_segments["c"]
+        batch_descriptor = BatchDescriptor(num_tokens)
+        cudagraph_runtime_mode = CUDAGraphMode.NONE
+
+        with set_ascend_forward_context(
+            attn_metadata=draft_attn_metadata,
+            vllm_config=self.vllm_config,
+            num_tokens=num_tokens,
+            num_actual_tokens=num_tokens,
+            batch_descriptor=batch_descriptor,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            is_draft_model=True,
+        ):
+            output = segment(**model_kwargs)
+        assert isinstance(output, IntermediateTensors)
+
+        if get_pp_group().world_size == 2:
+            send_work = edge_cloud_send_tensor_dict_mtp(
+                {
+                    k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                    for k, v in output.items()
+                }
+            )
+            for handle in send_work:
+                handle.wait()
 
     def _sync_metadata_across_dp(
         self,
@@ -4030,6 +4392,7 @@ class NPUModelRunner(GPUModelRunner):
         return {
             BatchType.PREFILL_FIRST: BatchType.PREFILL_LAST,
             BatchType.DECODE_FIRST: BatchType.DECODE_LAST,
+            BatchType.MTP_DRAFT_FIRST: BatchType.MTP_DRAFT_LAST,
         }[head_bt]
 
     def _edge_cloud_forward_cloud(
