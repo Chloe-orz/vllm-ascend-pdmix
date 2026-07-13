@@ -1033,10 +1033,6 @@ class NPUWorker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
-    @torch.inference_mode()
-    def drain_pending_mtp_draft(self) -> bool:
-        return self.model_runner.drain_pending_mtp_draft()
-
     def check_health(self) -> None:
         import subprocess
 

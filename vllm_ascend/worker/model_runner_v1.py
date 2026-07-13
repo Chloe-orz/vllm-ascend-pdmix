@@ -21,7 +21,7 @@ import math
 import os
 import sys
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -251,22 +251,6 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
-
-
-class PendingMTPDraftState(NamedTuple):
-    """Cached inputs required to run the MTP drafter after verify sampling."""
-
-    sampled_token_ids: torch.Tensor | list[list[int]]
-    sampling_metadata: SamplingMetadata
-    scheduler_output: "SchedulerOutput"
-    spec_decode_metadata: SpecDecodeMetadata | None
-    spec_decode_common_attn_metadata: AscendCommonAttentionMetadata
-    positions: torch.Tensor
-    num_scheduled_tokens: int
-    hidden_states: torch.Tensor
-    aux_hidden_states: list[torch.Tensor] | None
-    sample_hidden_states: torch.Tensor | None
-    target_model_batch_desc: BatchDescriptor | None
 
 
 
@@ -1882,15 +1866,6 @@ class NPUModelRunner(GPUModelRunner):
                 num_prefill_reqs = 0
                 num_decode_reqs = 0
 
-            # Some MTP target models expose the exact hidden stream expected
-            # by their draft module. DeepSeek V4 MTP, for example, needs the
-            # pre-hc_head residual instead of the sampled hidden_states tensor.
-            mtp_hidden_states = getattr(
-                self.get_model(), "get_mtp_target_hidden_states", lambda: None
-            )()
-            if mtp_hidden_states is not None:
-                hidden_states = mtp_hidden_states
-
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
                 # update pcp related params
@@ -1997,46 +1972,6 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
-
-    def _stage_pending_mtp_draft(
-        self,
-        pending_draft: PendingMTPDraftState,
-    ) -> None:
-        pending_drafts: deque[PendingMTPDraftState] | None = getattr(
-            self, "_pending_mtp_draft_states", None
-        )
-        if pending_drafts is None:
-            pending_drafts = deque()
-            self._pending_mtp_draft_states = pending_drafts
-        pending_drafts.append(pending_draft)
-
-    def _drain_pending_mtp_draft(self) -> bool:
-        pending_drafts: deque[PendingMTPDraftState] | None = getattr(
-            self, "_pending_mtp_draft_states", None
-        )
-        if not pending_drafts:
-            return False
-
-        pending_draft = pending_drafts.popleft()
-        self._draft_token_ids = self.propose_draft_token_ids(
-            pending_draft.sampled_token_ids,
-            pending_draft.sampling_metadata,
-            pending_draft.scheduler_output,
-            pending_draft.spec_decode_metadata,
-            pending_draft.spec_decode_common_attn_metadata,
-            pending_draft.positions,
-            pending_draft.num_scheduled_tokens,
-            pending_draft.hidden_states,
-            pending_draft.aux_hidden_states,
-            pending_draft.sample_hidden_states,
-            pending_draft.target_model_batch_desc,
-        )
-        self._copy_draft_token_ids_to_cpu(pending_draft.scheduler_output)
-        self.finalize_kv_connector()
-        return True
-
-    def drain_pending_mtp_draft(self) -> bool:
-        return self._drain_pending_mtp_draft()
 
     @torch.inference_mode()
     def execute_model(
@@ -2675,10 +2610,6 @@ class NPUModelRunner(GPUModelRunner):
             self.sampling_done_event.record()
 
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
-        is_mtp_spec_decode = (
-            self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
-        )
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2696,24 +2627,6 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
-
-        def stage_pending_mtp_draft(sampled_token_ids):
-            assert spec_decode_common_attn_metadata is not None
-            self._stage_pending_mtp_draft(
-                PendingMTPDraftState(
-                    sampled_token_ids=sampled_token_ids,
-                    sampling_metadata=self.input_batch.sampling_metadata,
-                    scheduler_output=scheduler_output,
-                    spec_decode_metadata=spec_decode_metadata,
-                    spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
-                    positions=positions,
-                    num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
-                    hidden_states=hidden_states,
-                    aux_hidden_states=aux_hidden_states,
-                    sample_hidden_states=sample_hidden_states,
-                    target_model_batch_desc=batch_desc,
-                )
-            )
 
         (
             logprobs_lists,
@@ -2743,22 +2656,11 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
-                draft_proposed = False
-                if is_mtp_spec_decode:
-                    # MTP draft is staged here and drained by EngineCore after
-                    # VERIFY output handling, so sample_tokens can return
-                    # without running the proposer on this call stack.
-                    if use_padded_batch:
-                        stage_pending_mtp_draft(sampler_output.sampled_token_ids)
-                    else:
-                        stage_pending_mtp_draft(valid_sampled_token_ids)
-                    draft_proposed = True
-                if use_padded_batch and not draft_proposed:
+                if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                    draft_proposed = True
-                if self.speculative_config and not use_padded_batch and not draft_proposed:
+                if self.speculative_config and not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -2766,7 +2668,7 @@ class NPUModelRunner(GPUModelRunner):
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
-            if self.speculative_config is not None and not is_mtp_spec_decode:
+            if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
         routed_experts_lists = None

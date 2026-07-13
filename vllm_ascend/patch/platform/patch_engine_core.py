@@ -225,39 +225,6 @@ def _needs_sample_tokens(self, scheduler_output: SchedulerOutput) -> bool:
     return bt in (BatchType.PREFILL_LAST, BatchType.DECODE_LAST)
 
 
-def _is_mtp_spec_decode(self) -> bool:
-    speculative_config = getattr(self.vllm_config, "speculative_config", None)
-    return bool(
-        speculative_config is not None
-        and getattr(speculative_config, "method", None) == "mtp"
-    )
-
-
-def _is_pd_separated_edge(self) -> bool:
-    return getattr(self, "_pp_pd_channel", None) is not None
-
-
-def _drain_pending_mtp_draft(self) -> bool:
-    if not self._is_mtp_spec_decode():
-        return False
-    if self._is_pd_separated_edge():
-        raise RuntimeError(
-            "MTP local pending-draft bridge does not support edge-cloud "
-            "PD separation. Implement MTP_DRAFT_FIRST/LAST with a dedicated "
-            "PD channel before enabling MTP in this mode."
-        )
-    drained = self.model_executor.drain_pending_mtp_draft()
-    if isinstance(drained, (list, tuple)):
-        return any(bool(item) for item in drained)
-    return bool(drained)
-
-
-def _update_draft_token_ids(self) -> None:
-    draft_token_ids = self.model_executor.take_draft_token_ids()
-    if draft_token_ids is not None:
-        self.scheduler.update_draft_token_ids(draft_token_ids)
-
-
 # =======================================================================#
 # EngineCore.step — full replacement, mirrors upstream + dest inserts.    #
 # =======================================================================#
@@ -300,8 +267,6 @@ def _patched_step(self):
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    if self._drain_pending_mtp_draft():
-        self._update_draft_token_ids()
 
     return (
         engine_core_outputs,
@@ -400,7 +365,6 @@ def _patched_step_with_batch_queue(self):
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    mtp_draft_drained = self._drain_pending_mtp_draft()
 
     if deferred_scheduler_output:
         if self.use_spec_decode:
@@ -418,8 +382,6 @@ def _patched_step_with_batch_queue(self):
         batch_queue.appendleft(
             (future, deferred_scheduler_output, exec_future)
         )
-    elif mtp_draft_drained:
-        self._update_draft_token_ids()
 
     return engine_core_outputs, model_executed
 
@@ -529,10 +491,6 @@ def install() -> None:
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
     EngineCore._needs_sample_tokens = _needs_sample_tokens
-    EngineCore._is_mtp_spec_decode = _is_mtp_spec_decode
-    EngineCore._is_pd_separated_edge = _is_pd_separated_edge
-    EngineCore._drain_pending_mtp_draft = _drain_pending_mtp_draft
-    EngineCore._update_draft_token_ids = _update_draft_token_ids
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
     EngineCore.shutdown = _patched_engine_core_shutdown
