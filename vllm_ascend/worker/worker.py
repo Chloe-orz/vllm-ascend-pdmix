@@ -43,6 +43,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
@@ -68,7 +69,9 @@ from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
     edge_cloud_broadcast_recv,
     edge_cloud_send_tensor_dict,
+    get_edge_cloud_tensor_meta,
     init_ascend_model_parallel,
+    init_edge_cloud_tensor_meta,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -99,6 +102,31 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+
+def _detect_has_residual(model_config) -> bool:
+    """Detect whether the model produces a residual tensor in IntermediateTensors.
+
+    Models with residual connections (most decoder-only LLMs) output
+    {"hidden_states": ..., "residual": ...} in IntermediateTensors,
+    while models without residual output only {"hidden_states": ...}.
+
+    Detection strategy: check the model's architecture class for the
+    presence of residual stream handling.
+    """
+    hf_config = getattr(model_config, "hf_text_config", None)
+    model_type = getattr(hf_config, "model_type", "") if hf_config else ""
+    # Qwen3.5 / Qwen3.5-MoE use residual connections
+    if "qwen3" in model_type:
+        return True
+    # DeepSeek V4 uses hc_pre/hc_post which is equivalent to a residual
+    # stream; its IntermediateTensors always contain both hidden_states
+    # and residual.
+    if model_type == "deepseek_v4":
+        return True
+    # Default: most modern decoder models produce residual
+    # Can be made more specific as more models are supported
+    return True
 
 
 class NPUWorker(WorkerBase):
@@ -237,10 +265,11 @@ class NPUWorker(WorkerBase):
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        if envs_ascend.VLLM_ASCEND_ENABLE_NZ:
+        nz_mode = get_ascend_config().weight_nz_mode
+        if nz_mode:
             raise ValueError(
                 "FRACTAL_NZ mode is enabled. This may cause model parameter precision issues "
-                "in the RL scenarios. Please set VLLM_ASCEND_ENABLE_NZ=0."
+                "in the RL scenarios. Please set weight_nz_mode=0 via --additional-config."
             )
         allocator = CaMemAllocator.get_instance()
         allocator.wake_up(tags=tags)
@@ -347,6 +376,29 @@ class NPUWorker(WorkerBase):
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+
+        # Initialize edge-cloud tensor metadata for optimized communication
+        # (skips inter-node metadata sync in irecv_tensor_dict/isend_tensor_dict)
+        if getattr(self.model_runner, '_edge_cloud_enabled', False):
+            hidden_size = self.model_config.hf_text_config.hidden_size
+            # Derive dtype directly from model config (same as MindIE's
+            # self.config.torch_dtype from config.json), instead of
+            # requiring a separate user-configured hidden_dtype.
+            # model_config.dtype is a torch.dtype resolved from the
+            # model's config.json torch_dtype field by _get_and_verify_dtype().
+            hidden_dtype = self.model_config.dtype
+            has_residual = _detect_has_residual(self.model_config)
+            # DeepSeek V4 uses hc_mult > 1 (HC mechanism produces 3D
+            # intermediate tensors).  Standard models (Qwen3.5, Llama,
+            # etc.) do not have hc_mult, defaulting to 1 (2D tensors).
+            hc_mult = getattr(self.model_config.hf_text_config, 'hc_mult', 1)
+            init_edge_cloud_tensor_meta(
+                hidden_size=hidden_size,
+                hidden_dtype=hidden_dtype,
+                has_residual=has_residual,
+                hc_mult=hc_mult,
+                mode=self.model_runner.edge_cloud_cfg.mode,
+            )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -463,6 +515,40 @@ class NPUWorker(WorkerBase):
         for handle in handles:
             handle.wait()
 
+    def _all_gather_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """All-gather tensors across the local TP group along sequence dim.
+
+        Used in edge-cloud mode when edge and cloud have different SP sizes.
+        Before cross-PP send, each side must aggregate its SP shards back to
+        the full sequence so the remote side can re-chunk with its own SP size.
+        """
+        tp_group = get_tp_group()
+        pc = self.vllm_config.parallel_config
+        # In edge-cloud mode, ensure the all-gathered length is also padded to
+        # the remote side's TP size so no extra padding is needed after recv.
+        target_tp_size = None
+        if pc.enable_edge_cloud:
+            target_tp_size = pc.cloud_npu_count if pc.is_edge_node else pc.edge_npu_count
+
+        result = {}
+        for key, tensor in tensor_dict.items():
+            if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                gathered = tp_group.all_gather(tensor, dim=0)
+                # Pad sequence to target_tp_size if heterogeneous SP is used
+                if target_tp_size is not None and target_tp_size > 1:
+                    seq_len = gathered.size(0)
+                    remainder = seq_len % target_tp_size
+                    if remainder != 0:
+                        pad_len = target_tp_size - remainder
+                        gathered = torch.nn.functional.pad(gathered, (0, 0, 0, pad_len))
+                result[key] = gathered
+            else:
+                result[key] = tensor
+        return result
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -546,10 +632,18 @@ class NPUWorker(WorkerBase):
             return output
 
         assert isinstance(output, IntermediateTensors)
+        # Edge-cloud with heterogeneous SP: aggregate SP shards to full
+        # sequence before cross-PP send so cloud can re-chunk by its SP.
+        if enable_sp() and (self.model_runner.edge_cloud_cfg.mode != "embedding_only"
+            or not self.model_runner.supports_mm_inputs):
+            _gathered = self._all_gather_tensor_dict(output.tensors)
+        else:
+            _gathered = output.tensors
         if get_pp_group().world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
             self._record_pp_send_work(
-                edge_cloud_send_tensor_dict(output.tensors, channel=channel),
+                edge_cloud_send_tensor_dict(_gathered, channel=channel,
+                                            num_tokens=scheduler_output.total_num_scheduled_tokens),
                 channel=channel,
             )
             logger.info(f"Send intermediate tensors to cloud, hidden_channel: {channel.value}")
@@ -567,13 +661,24 @@ class NPUWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
         layer_slice_info: Any,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        edge_sp = enable_sp()
+        edge_merge = get_edge_cloud_tensor_meta().merge_payload
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         channel = self._hidden_channel_for(scheduler_output)
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
-            channel=channel
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            channel=channel,
+            sp_chunk=edge_sp and edge_merge,
         )
         logger.info(f"Receive intermediate tensors from cloud after, hidden_channel: {channel.value}")
+
+        if edge_sp and not edge_merge:
+            tensor_dict = {
+                k: sequence_parallel_chunk(v)
+                for k, v in tensor_dict.items()
+            }
+
         intermediate_tensors = AsyncIntermediateTensors(
             tensor_dict,
             comm_handles=comm_handles,
@@ -616,11 +721,34 @@ class NPUWorker(WorkerBase):
         )
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and is_first_slice:
+            # Pre-compute input preparation while edge runs segment_a.
+            # This overlaps cloud's _update_states, _prepare_inputs,
+            # _determine_batch_execution_and_padding, and
+            # _build_attention_metadata with edge's segment_a forward.
+            # On the merge_payload fast path the per-key tensors are
+            # materialized lazily inside comm_postprocess (after the
+            # merged buffer is split), so SP chunking must run there too
+            # — an eager chunk here would iterate an empty dict, rebind
+            # the variable, and sever the link to the postprocess that
+            # fills the original dict by reference (broken tokens).
+            do_sp_chunk = enable_sp() and (
+                self.model_runner.edge_cloud_cfg.mode != "embedding_only"
+                or not self.model_runner.supports_mm_inputs)
+            merge_payload = get_edge_cloud_tensor_meta().merge_payload
             channel = self._hidden_channel_for(scheduler_output)
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
-                channel=channel
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                channel=channel,
+                sp_chunk=do_sp_chunk and merge_payload,
             )
             logger.info(f"Received intermediate tensors from edge, hidden_channel={channel.value}")
+
+            self.model_runner.cloud_prepare_early(scheduler_output)
+            if do_sp_chunk and not merge_payload:
+                tensor_dict = {
+                    k: sequence_parallel_chunk(v)
+                    for k, v in tensor_dict.items()
+                }
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -646,19 +774,17 @@ class NPUWorker(WorkerBase):
             return output
 
         assert isinstance(output, IntermediateTensors)
-        # Echo the head_token back to the edge so the tail segment can
-        # correlate the data-plane tensor with the control-plane scheduler output.
-        token = scheduler_output.head_token
-        if token:
-            output.tensors["_head_token"] = torch.tensor(
-                list(bytearray(token, "utf-8")),
-                dtype=torch.uint8,
-                device="npu",
-            )
+        # Edge-cloud with heterogeneous SP: aggregate SP shards to full
+        # sequence before cross-PP send so edge can re-chunk by its SP.
+        if enable_sp():
+            _gathered = self._all_gather_tensor_dict(output.tensors)
+        else:
+            _gathered = output.tensors
         if get_pp_group().world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
             self._record_pp_send_work(
-                edge_cloud_send_tensor_dict(output.tensors, channel=channel),
+                edge_cloud_send_tensor_dict(_gathered, channel=channel,
+                                            num_tokens=scheduler_output.total_num_scheduled_tokens),
                 channel=channel,
             )
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")

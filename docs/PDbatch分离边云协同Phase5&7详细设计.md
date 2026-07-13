@@ -737,13 +737,7 @@ sampling metadata
 KV metadata
 ```
 
-并且数据面 `IntermediateTensors` 中必须携带：
-
-```text
-_head_token
-```
-
-用于边侧 tail segment 恢复 HeadState。
+数据面 `IntermediateTensors` 不再携带调度 token；边侧 tail segment 通过控制面 `head_token` 恢复 HeadState，数据面由 `hidden_channel` / 调度保证对齐。
 
 ## 4.8 云侧正确性不变量
 
@@ -755,7 +749,7 @@ Phase7 必须满足：
 3. PREFILL_FIRST 必须返回 PREFILL_LAST。
 4. DECODE_FIRST 必须返回 DECODE_LAST。
 5. POST_OUT 返回的 SchedulerOutput 必须保留 head_token。
-6. 数据面 IntermediateTensors 必须携带 _head_token。
+6. 数据面 IntermediateTensors 通过 hidden_channel / 调度保证与控制面 tail batch 对齐。
 7. PassiveScheduler 不允许把 PREFILL_LAST / DECODE_LAST 放入 ready queue。
 8. EMPTY 不进入 ready queue，不 enqueue worker。
 9. 云侧状态机只根据 P中/D中 调度结果更新。
@@ -1158,8 +1152,10 @@ head_token
 匹配：
 
 ```text
-SchedulerOutput.head_token == IntermediateTensors["_head_token"]
+SchedulerOutput.head_token -> _pending_head_states[head_token]
 ```
+
+数据面 hidden tensors 由调度选择的 `hidden_channel` 保证与该控制面 tail batch 对齐。
 
 ## 9.3 Tail segment 重复 update 风险
 

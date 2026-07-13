@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import os
 import time
 from collections import deque
+
+import numpy as np
 from collections.abc import Iterable
 from typing import Any
 from uuid import uuid4
@@ -138,6 +141,20 @@ class PDSeparatedScheduler(Scheduler):
         # decode scheduling until PL completes and they are moved to running.
         self.prefill_last_pending: list[Request] = []
 
+        # [新增] DECODE_LAST 延迟调度计时器。
+        # D首 pick 后启动，D尾 在延迟到期前不可被调度。
+        self._decode_last_delay_start_ts: float | None = None
+        self._decode_last_delay_schedule_ms: int = 30
+
+        # [新增] 强制调度 D尾 标记。
+        # D首 调度后置 True，D尾 调度后置 False。
+        # True 时禁止调度 D首，严格保证 DF -> DL 交替时序。
+        self._force_decode_last: bool = False
+
+        self._layer_slice_config_path: str | None = None
+        self._layer_slice_config_mtime: float = 0.0
+        self._load_layer_slice_config()
+
     def schedule(self) -> SchedulerOutput:
         return self._schedule_pd_separated()
 
@@ -160,8 +177,10 @@ class PDSeparatedScheduler(Scheduler):
         return scheduler_output
 
     def _pick_by_state(self, state: PrefillState) -> SchedulerOutput:
+        # D尾必须无条件优先于 D首，防止 decode_inflight_count 在 D首
+        # 完成后立即释放导致 D尾 starvation。
         if state == PrefillState.IDLE:
-            # IDLE: P首/chunk0首 > D首 > D尾 > Empty.
+            # IDLE: P首/chunk0首 > D尾 > D首 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -175,14 +194,14 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
+            if self.decodes_last_ready and self._can_schedule_decode_last():
+                return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
-            if self.decodes_last_ready:
-                return self._pick_decode_last_batch()
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
-            # LOW: chunk/P首(when slot available) > P尾 > D首 > D尾 > Empty.
+            # LOW: chunk/P首(when slot available) > D尾 > D首 > P尾 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -193,21 +212,21 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
-            if self.prefills_last_ready:
-                return self._pick_prefill_last_batch()
+            if self.decodes_last_ready and self._can_schedule_decode_last():
+                return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
-            if self.decodes_last_ready:
-                return self._pick_decode_last_batch()
+            if self.prefills_last_ready:
+                return self._pick_prefill_last_batch()
             return self._make_empty_batch()
 
-        # HIGH: P尾 > D首 > D尾 > Empty. New P首 is forbidden.
-        if self.prefills_last_ready:
-            return self._pick_prefill_last_batch()
+        # HIGH: D尾 > D首 > P尾 > Empty. New P首 is forbidden.
+        if self.decodes_last_ready and self._can_schedule_decode_last():
+            return self._pick_decode_last_batch()
         if self._can_schedule_decode_first():
             return self._pick_decode_first_batch()
-        if self.decodes_last_ready:
-            return self._pick_decode_last_batch()
+        if self.prefills_last_ready:
+            return self._pick_prefill_last_batch()
         return self._make_empty_batch()
 
     def is_waiting_for_remote_tail(self) -> bool:
@@ -255,6 +274,7 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             self.running
             and self.decode_inflight_count < self.decode_inflight_limit
+            and not self._force_decode_last
         )
 
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
@@ -270,6 +290,90 @@ class PDSeparatedScheduler(Scheduler):
             f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
             f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
         )
+
+    # ------------------------------------------------------------------ #
+    # Layer-slice config loading (Edge side)                             #
+    # ------------------------------------------------------------------ #
+    def _load_layer_slice_config(self) -> None:
+        """Load decode_last_delay_schedule_ms from layer_slice_config.yaml."""
+        yaml_path = os.environ.get("VLLM_LAYER_SLICE_CONFIG")
+        if yaml_path is None:
+            yaml_path = os.path.join(
+                os.path.dirname(__file__), "layer_slice_config.yaml"
+            )
+        if not os.path.exists(yaml_path):
+            self._layer_slice_config_path = None
+            self._layer_slice_config_mtime = 0.0
+            return
+        try:
+            import yaml
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            if not isinstance(raw, dict):
+                logger.warning(
+                    "Layer-slice config %s is not a dict; ignoring.", yaml_path
+                )
+                return
+            _key = "decode_last_delay_schedule_ms"
+            if _key in raw:
+                try:
+                    self._decode_last_delay_schedule_ms = int(raw[_key])
+                    logger.info(
+                        "[PDSeparatedScheduler] %s set to %d from %s",
+                        _key, self._decode_last_delay_schedule_ms, yaml_path,
+                    )
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Invalid %s value %r in %s; keeping %d",
+                        _key, raw[_key], yaml_path,
+                        self._decode_last_delay_schedule_ms,
+                    )
+            self._layer_slice_config_path = yaml_path
+            self._layer_slice_config_mtime = os.path.getmtime(yaml_path)
+        except Exception:
+            logger.exception("Failed to load layer-slice config from %s", yaml_path)
+
+    def _maybe_hot_reload_layer_slice_config(self) -> None:
+        """Check whether the YAML config file has changed on disk and reload."""
+        path = self._layer_slice_config_path
+        if path is None:
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        if mtime != self._layer_slice_config_mtime:
+            old_value = self._decode_last_delay_schedule_ms
+            self._load_layer_slice_config()
+            if self._decode_last_delay_schedule_ms != old_value:
+                logger.info(
+                    "[PDSeparatedScheduler] Layer-slice config hot-reloaded: "
+                    "%s=%d",
+                    "decode_last_delay_schedule_ms",
+                    self._decode_last_delay_schedule_ms,
+                )
+
+    # ------------------------------------------------------------------ #
+    # DECODE_LAST delay scheduling                                       #
+    # ------------------------------------------------------------------ #
+    def _start_decode_last_delay(self) -> None:
+        """Start the timer when DECODE_FIRST is picked.
+        DECODE_LAST cannot be scheduled until the delay expires."""
+        self._decode_last_delay_start_ts = time.monotonic()
+
+    def _can_schedule_decode_last(self) -> bool:
+        """Return True if the delay since DECODE_FIRST has elapsed."""
+        if self._decode_last_delay_start_ts is None:
+            return True
+        elapsed_ms = (time.monotonic() - self._decode_last_delay_start_ts) * 1000
+        if elapsed_ms >= self._decode_last_delay_schedule_ms:
+            self._decode_last_delay_start_ts = None
+            return True
+        logger.info(
+            "[PD] DECODE_LAST delayed: elapsed=%.1f ms < limit=%d ms",
+            elapsed_ms, self._decode_last_delay_schedule_ms,
+        )
+        return False
 
     def _pick_prefill_first_batch(self) -> SchedulerOutput:
         saved_running = self.running
@@ -397,6 +501,7 @@ class PDSeparatedScheduler(Scheduler):
             f"decodes_last_ready expects DECODE_LAST, got {so.batch_type}"
         )
         self._validate_decode_tail_channel(so)
+        self._force_decode_last = False
         return so
 
     def _ensure_cached_all_token_ids(
@@ -431,9 +536,11 @@ class PDSeparatedScheduler(Scheduler):
             cached_reqs.num_output_tokens,
         ):
             if num_output_tokens > 0 and req_id not in cached_reqs.all_token_ids:
+                # Use the Request-level cached np.ndarray to avoid repeated
+                # np.asarray() conversion of the Python list (dominant
+                # bottleneck on long-sequence decode batches).
                 cached_reqs.all_token_ids[req_id] = (
-                    self.requests[req_id].all_token_ids.copy()
-                )
+                    self.requests[req_id].cached_all_token_ids_np)
 
     def _pick_decode_first_batch(self) -> SchedulerOutput:
         if not self.running:
@@ -454,10 +561,9 @@ class PDSeparatedScheduler(Scheduler):
             if scheduler_output is not None:
                 if scheduler_output.total_num_scheduled_tokens == 0:
                     scheduler_output.batch_type = BatchType.EMPTY
-                    logger.error(
-                        "DECODE_FIRST returned empty batch (total_num_scheduled_tokens=0) "
-                        "despite %d running requests. This indicates a severe KV cache "
-                        "shortage or scheduler budget exhaustion.",
+                    logger.debug(
+                        "DECODE_FIRST race: empty batch due to async "
+                        "update_from_output delay, running=%d",
                         len(self.running),
                     )
                 else:
@@ -468,21 +574,8 @@ class PDSeparatedScheduler(Scheduler):
                     )
                     self._ensure_cached_all_token_ids(scheduler_output)
                     self.decode_inflight_count += 1
-
-                    # === Decode-first self-posting optimization ===
-                    # Cloud's _maybe_publish_post_out merely replaces
-                    # batch_type with DECODE_LAST.  We pre-generate it on
-                    # the edge side and stash it in decodes_last_ready so
-                    # that scheduling DECODE_LAST needs no round-trip
-                    # through POST_OUT.  The cloud unconditionally skips
-                    # POST_OUT for all DECODE_FIRST batches.
-                    from dataclasses import replace
-                    decode_last = replace(
-                        scheduler_output,
-                        batch_type=BatchType.DECODE_LAST,
-                    )
-                    self.decodes_last_ready.append(decode_last)
-                    # ===============================================
+                    self._force_decode_last = True
+                    self._start_decode_last_delay()
                 for req in list(self.waiting):
                     saved_waiting.prepend_request(req)
                 self.chunk_prefill_first = saved_chunk_prefill_first
@@ -578,9 +671,18 @@ class PDSeparatedScheduler(Scheduler):
                 f"running[]: {len(self.running)}, "
                 f"chunk_prefill_first[]: {len(self.chunk_prefill_first)}",
             )
-        if scheduler_output.batch_type == BatchType.DECODE_LAST:
+        if scheduler_output.batch_type == BatchType.DECODE_FIRST:
+            # D首完成后立即释放 inflight 计数，使下一个 D首可以
+            # 在 D尾仍在 batch_queue 中时就被调度，消除 Cloud idle gap。
             if self.decode_inflight_count > 0:
                 self.decode_inflight_count -= 1
+            logger.info(
+                f"[PD] update_from_output DECODE_FIRST done, "
+                f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
+            )
+        if scheduler_output.batch_type == BatchType.DECODE_LAST:
+            # decode_inflight_count 已在 DECODE_FIRST 的 update_from_output
+            # 中释放，此处不再重复减 1。
             logger.info(
                 f"[PD] update_from_output DECODE_LAST done, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",

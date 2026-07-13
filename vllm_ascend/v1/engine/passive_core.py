@@ -33,6 +33,8 @@ the upstream ``vllm/v1/engine/core.py`` stays untouched.
 """
 from __future__ import annotations
 
+import copy
+import os
 import pickle
 import queue
 import signal
@@ -40,8 +42,10 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
+import numpy as np
 import zmq
-from vllm.logger import init_logger
+from vllm import envs
+from vllm.logger import logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -51,8 +55,6 @@ from vllm.v1.core.sched.output import BatchType, SchedulerOutput
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-logger = init_logger(__name__)
 
 
 def _import_passive_scheduler_module():
@@ -345,6 +347,89 @@ class PPSchedulerZmqChannel:
         self._subscriber.shutdown()
 
 
+
+
+def _trim_scheduler_output_for_worker_enqueue(
+    scheduler_output: SchedulerOutput,
+    prev_dispatch_req_ids: set[str] | None,
+) -> SchedulerOutput:
+    """Trim large cached token lists before cloud EngineCore -> worker MQ.
+
+    Cloud worker ``_update_states`` only needs ``all_token_ids`` for cached
+    requests that are not already in its persistent batch and have output
+    tokens.  The best local approximation is the previous cloud dispatch batch:
+    continuously dispatched requests can drop ``all_token_ids`` while newly
+    appearing / resumed requests keep it.
+    """
+    cached = scheduler_output.scheduled_cached_reqs
+    if cached is None:
+        return scheduler_output
+
+    all_token_ids = getattr(cached, "all_token_ids", None)
+    if not all_token_ids:
+        return scheduler_output
+
+    prev_dispatch_req_ids = prev_dispatch_req_ids or set()
+    resumed_req_ids = getattr(cached, "resumed_req_ids", set()) or set()
+    num_output_tokens_by_req = {
+        req_id: num_output_tokens
+        for req_id, num_output_tokens in zip(
+            getattr(cached, "req_ids", ()),
+            getattr(cached, "num_output_tokens", ()),
+        )
+    }
+    keep_req_ids = {
+        req_id
+        for req_id in all_token_ids
+        if req_id in resumed_req_ids
+        or (
+            req_id not in prev_dispatch_req_ids
+            and num_output_tokens_by_req.get(req_id, 0) > 0
+        )
+    }
+    trimmed_all_token_ids = {}
+    for req_id, token_ids in all_token_ids.items():
+        if req_id not in keep_req_ids:
+            continue
+        num_output_tokens = num_output_tokens_by_req.get(req_id, 0)
+        if num_output_tokens <= 0:
+            continue
+        keep_len = min(num_output_tokens, len(token_ids))
+        if keep_len <= 0:
+            continue
+        trimmed_all_token_ids[req_id] = np.ascontiguousarray(
+            token_ids[-keep_len:]
+        )
+    if len(trimmed_all_token_ids) == len(all_token_ids) and all(
+        len(trimmed_all_token_ids[req_id]) == len(token_ids)
+        for req_id, token_ids in all_token_ids.items()
+    ):
+        return scheduler_output
+
+    before_tokens = sum(len(token_ids) for token_ids in all_token_ids.values())
+    after_tokens = sum(
+        len(token_ids) for token_ids in trimmed_all_token_ids.values()
+    )
+    logger.info(
+        "[CLOUD-MQ-TRIM] batch_type=%s reqs=%d prev_dispatch_reqs=%d "
+        "resumed=%d all_token_ids entries %d->%d tokens %d->%d",
+        scheduler_output.batch_type.value,
+        len(getattr(cached, "req_ids", ())),
+        len(prev_dispatch_req_ids),
+        len(resumed_req_ids),
+        len(all_token_ids),
+        len(trimmed_all_token_ids),
+        before_tokens,
+        after_tokens,
+    )
+
+    so_copy = copy.copy(scheduler_output)
+    cached_copy = copy.copy(cached)
+    cached_copy.all_token_ids = trimmed_all_token_ids
+    so_copy.scheduled_cached_reqs = cached_copy
+    return so_copy
+
+
 class PassiveEngineCoreProc:
     """Passive EngineCore process for non-leader PP ranks.
 
@@ -402,6 +487,46 @@ class PassiveEngineCoreProc:
             )
         self._idle_sleep_seconds = 0.001
 
+        self._prev_dispatch_req_ids: set[str] = set()
+        self._pending_post_out_by_head_token: dict[str, SchedulerOutput] = {}
+        self._published_post_out_tokens: set[str] = set()
+
+    def _drain_worker_completion_acks(self) -> None:
+        """Publish POST_OUT only after cloud workers complete the middle segment."""
+        for mq in getattr(self.executor, "response_mqs", []):
+            while True:
+                try:
+                    _status, result = mq.dequeue(timeout=0)
+                except TimeoutError:
+                    break
+                except Exception:
+                    logger.exception("Failed to drain cloud worker completion ack")
+                    break
+
+                if not (
+                    isinstance(result, dict)
+                    and result.get("__pp_scheduler_ack__")
+                ):
+                    continue
+
+                if result.get("batch_type") != BatchType.PREFILL_FIRST:
+                    continue
+                head_token = result.get("head_token")
+                if not head_token or head_token in self._published_post_out_tokens:
+                    continue
+                scheduler_output = self._pending_post_out_by_head_token.pop(
+                    head_token, None
+                )
+                if scheduler_output is None:
+                    continue
+                self._published_post_out_tokens.add(head_token)
+                logger.info(
+                    "[CLOUD-POST-OUT] Publishing PREFILL_LAST after worker done, "
+                    "head_token=%s",
+                    head_token,
+                )
+                self._maybe_publish_post_out(scheduler_output)
+
     def step(self) -> bool:
         """Single tick: poll ZMQ → pick batches → enqueue worker payloads.
 
@@ -412,6 +537,7 @@ class PassiveEngineCoreProc:
             True if at least one payload was enqueued, False if the
             scheduler had nothing to dispatch.
         """
+        self._drain_worker_completion_acks()
         self.passive_scheduler.poll_and_classify()
         batch = self.passive_scheduler.schedule()
         if batch.is_empty():
@@ -437,22 +563,45 @@ class PassiveEngineCoreProc:
         )
 
         for slice_info in batch.slices:
-            payload = (
-                (batch.scheduler_output, slice_info)
-                if slice_info is not None
-                else (batch.scheduler_output,)
+            worker_scheduler_output = _trim_scheduler_output_for_worker_enqueue(
+                batch.scheduler_output,
+                self._prev_dispatch_req_ids,
             )
+            payload = (
+                (worker_scheduler_output, slice_info)
+                if slice_info is not None
+                else (worker_scheduler_output,)
+            )
+            bt = batch.scheduler_output.batch_type.value
+            logger.info("[CLOUD-MQ] About to enqueue batch_type=%s", bt)
+            _t0 = time.monotonic()
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
-            # PD-separation: on the cloud side, publish the rewritten
-            # tail-segment SchedulerOutput on POST_OUT only when the dispatched
-            # work can produce the final middle-segment hidden state. With
-            # slice-aware scheduling, early prefill slices must not wake the
-            # edge tail segment because doing so can block the edge on a recv
-            # and prevent it from issuing decode head work between P slices.
-            if slice_info is None or slice_info.is_last_slice:
+            self._prev_dispatch_req_ids = set(
+                batch.scheduler_output.num_scheduled_tokens.keys()
+            )
+            _dt_ms = (time.monotonic() - _t0) * 1000
+            logger.info(
+                "[CLOUD-ENQUEUE] %s enqueue took %.3f ms",
+                bt,
+                _dt_ms,
+            )
+            # For PREFILL_FIRST, POST_OUT must mean the cloud middle segment
+            # has completed and started sending hidden states back.  Store the
+            # original SchedulerOutput here and publish it from
+            # _drain_worker_completion_acks() after the worker reports done.
+            if batch.scheduler_output.batch_type == BatchType.DECODE_FIRST:
                 self._maybe_publish_post_out(batch.scheduler_output)
+            elif (
+                batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
+                and (slice_info is None or slice_info.is_last_slice)
+            ):
+                head_token = getattr(batch.scheduler_output, "head_token", None)
+                if head_token:
+                    self._pending_post_out_by_head_token[head_token] = (
+                        batch.scheduler_output
+                    )
         return True
 
     def _maybe_publish_post_out(
@@ -479,17 +628,9 @@ class PassiveEngineCoreProc:
                 scheduler_output, batch_type=BatchType.PREFILL_LAST
             )
         elif bt == BatchType.DECODE_FIRST:
-            # === Decode-first self-posting optimization ===
-            # Edge always pre-generates DECODE_LAST locally and stores it
-            # in decodes_last_ready.  Cloud never needs to send DECODE_LAST
-            # back via POST_OUT, eliminating control-plane round-trip.
-            logger.debug(
-                "[Cloud] Skipping POST_OUT for DECODE_FIRST "
-                "head_token=%s (edge pre-generates DECODE_LAST)",
-                scheduler_output.head_token,
+            tail = replace(
+                scheduler_output, batch_type=BatchType.DECODE_LAST
             )
-            return
-            # ===============================================
         else:
             return
         # Echo the head_token back so the edge can correlate the tail

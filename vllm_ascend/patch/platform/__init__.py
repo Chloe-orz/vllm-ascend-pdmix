@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+import vllm_ascend.patch.platform.patch_camem_allocator  # noqa
 import vllm_ascend.patch.platform.patch_distributed  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_interface  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
@@ -29,7 +32,11 @@ else:
     import vllm_ascend.patch.platform.patch_mamba_config_310  # noqa
 import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
 import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
-import vllm_ascend.patch.platform.patch_glm_tool_call_parser  # noqa
+import vllm_ascend.patch.platform.patch_glm_tool_call_streaming  # noqa
+import vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa
+import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
+import vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser  # noqa
+import vllm_ascend.patch.platform.patch_deepseek_v4_thinking  # noqa
 import vllm_ascend.patch.platform.patch_qwen3_5_config  # noqa
 import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
 import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
@@ -37,6 +44,12 @@ import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
 # Multiproc executor hooks are loaded unconditionally so passive EngineCore
 # processes can select the local + cross-node MQ path from ParallelConfig.
 import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
+
+import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
+
+if envs.VLLM_ASCEND_APPLY_DSV4_PATCH:
+    import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
+    import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 
 # EngineCore PD-separation / edge-cloud / passive-PP hooks. Unconditionally
 # loaded — every behavior change inside the patch is gated at runtime by the
@@ -48,6 +61,3 @@ import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 # requested — the flag is set on
 # the VllmConfig only and reaches us via ``EngineCore.__init__``.
 import vllm_ascend.patch.platform.patch_engine_core  # noqa
-
-if envs.VLLM_ASCEND_BALANCE_SCHEDULING:
-    import vllm_ascend.patch.platform.patch_balance_schedule  # noqa

@@ -100,6 +100,8 @@ class PassiveScheduler:
     `[None]` (single full-layer execution).
     """
 
+    _ARRIVAL_SEQ_ATTR = "_passive_scheduler_arrival_seq"
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -132,9 +134,12 @@ class PassiveScheduler:
         # `pp_subscriber.consume_new_outputs()` and pushes each SchedulerOutput
         # into `_inbox`; `poll_and_classify` drains `_inbox` instead of
         # touching the subscriber directly.
-        self._inbox: queue.Queue[SchedulerOutput] = queue.Queue()
+        self._inbox: queue.Queue[tuple[int, SchedulerOutput]] = queue.Queue()
         self._subscriber_thread: threading.Thread | None = None
         self._shutdown_event = threading.Event()
+
+        # [DIAG] Track DECODE_FIRST arrival intervals on the cloud side.
+        self._last_decode_first_arrival_ts: float | None = None
 
         # Precompute local layer count.  The actual slice count is resolved
         # per-batch from a YAML config (token threshold -> slice count).
@@ -219,8 +224,8 @@ class PassiveScheduler:
                 # Avoid a tight spin when the subscriber returns nothing.
                 self._shutdown_event.wait(0.001)
                 continue
-            for _seq, scheduler_output in new_outputs:
-                self._inbox.put(scheduler_output)
+            for seq, scheduler_output in new_outputs:
+                self._inbox.put((seq, scheduler_output))
 
     def shutdown(self) -> None:
         """Signal the subscriber thread to stop and join it."""
@@ -243,21 +248,17 @@ class PassiveScheduler:
             self._drain_subscriber_inline()
 
         while True:
-            has_ready_work = bool(
-                self.ready_prefills
-                or self._active_prefill_slices
-                or self.ready_pdmixes
-                or self.ready_decodes
-            )
             try:
-                scheduler_output = self._inbox.get_nowait()
+                seq, scheduler_output = self._inbox.get_nowait()
             except queue.Empty:
-                if has_ready_work:
-                    break
-                logger.info("poll_and_classify: inbox is empty")
-                scheduler_output = self._inbox.get(block=True)
+                break
+            self._remember_arrival_seq(scheduler_output, seq)
             bt = scheduler_output.batch_type
-            logger.info(f"Received scheduler_output from edge, batch_type: {bt}")
+            logger.info(
+                "Received scheduler_output from edge, seq=%d, batch_type: %s",
+                seq,
+                bt,
+            )
             if bt == BatchType.EMPTY:
                 continue
             elif bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
@@ -268,6 +269,14 @@ class PassiveScheduler:
                 self.ready_prefills.append(scheduler_output)
             elif bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
                 # Same reasoning as above for decode head segments.
+                now = time.monotonic()
+                if self._last_decode_first_arrival_ts is not None:
+                    interval_ms = (now - self._last_decode_first_arrival_ts) * 1000
+                    logger.info(
+                        "DECODE_FIRST arrival interval: %.2f ms",
+                        interval_ms,
+                    )
+                self._last_decode_first_arrival_ts = now
                 self.ready_decodes.append(scheduler_output)
             elif bt in (BatchType.PREFILL_LAST, BatchType.DECODE_LAST):
                 # Tail-segment batches are edge-only and must never be
@@ -282,19 +291,36 @@ class PassiveScheduler:
             else:  # PD_MIX (or anything unrecognized — treat as mix)
                 self.ready_pdmixes.append(scheduler_output)
             logger.debug(
-                "PassiveScheduler classified batch_type=%s "
+                "PassiveScheduler classified seq=%s batch_type=%s "
                 "(prefills=%d, pdmixes=%d, decodes=%d)",
+                self._arrival_seq(scheduler_output),
                 bt.value if bt is not None else "<none>",
                 len(self.ready_prefills),
                 len(self.ready_pdmixes),
                 len(self.ready_decodes),
             )
 
+    def _remember_arrival_seq(
+        self, scheduler_output: SchedulerOutput, seq: int
+    ) -> None:
+        try:
+            setattr(scheduler_output, self._ARRIVAL_SEQ_ATTR, seq)
+        except Exception:
+            logger.debug(
+                "Unable to attach arrival seq=%d to SchedulerOutput.",
+                seq,
+                exc_info=True,
+            )
+
+    def _arrival_seq(self, scheduler_output: SchedulerOutput) -> int | None:
+        seq = getattr(scheduler_output, self._ARRIVAL_SEQ_ATTR, None)
+        return seq if isinstance(seq, int) else None
+
     def _drain_subscriber_inline(self) -> None:
         """Used only when the subscriber thread is disabled (e.g. tests)."""
         new_outputs = self.pp_subscriber.consume_new_outputs()
-        for _seq, scheduler_output in new_outputs:
-            self._inbox.put(scheduler_output)
+        for seq, scheduler_output in new_outputs:
+            self._inbox.put((seq, scheduler_output))
 
     # ------------------------------------------------------------------ #
     # Layer-slice config loading                                         #
@@ -339,9 +365,26 @@ class PassiveScheduler:
                     "Layer-slice config %s is not a dict; ignoring.", yaml_path
                 )
                 return None
+            # Extract optional prefill_middle_throttle_ms (milliseconds) before filtering.
+            _throttle_key = "prefill_middle_throttle_ms"
+            if _throttle_key in raw:
+                try:
+                    self._prefill_middle_throttle_seconds = float(raw[_throttle_key]) / 1000.0
+                    logger.info(
+                        "[PassiveScheduler] %s set to %.1f ms (%.3f s) from %s",
+                        _throttle_key, float(raw[_throttle_key]),
+                        self._prefill_middle_throttle_seconds, yaml_path,
+                    )
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Invalid %s value %r in %s; keeping %.3f s",
+                        _throttle_key, raw[_throttle_key], yaml_path,
+                        self._prefill_middle_throttle_seconds,
+                    )
+
             # Normalize to int keys / values and sort descending by token threshold.
             config = {
-                int(k): int(v) for k, v in raw.items()
+                int(k): int(v) for k, v in raw.items() if isinstance(k, (int, str)) and str(k).lstrip('-').isdigit()
             }
             self._layer_slice_config_path = yaml_path
             self._layer_slice_config_mtime = os.path.getmtime(yaml_path)
@@ -504,6 +547,38 @@ class PassiveScheduler:
             start += size
         return boundaries
 
+    def _ready_prefill_is_sliced_first_block(self) -> bool:
+        if not self.ready_prefills:
+            return False
+        slices = self._slice_for(self.ready_prefills[0])
+        return len(slices) > 1 and isinstance(slices[0], LayerSliceInfo)
+
+    def _schedule_by_arrival(self) -> ScheduledBatch:
+        prefill_seq = self._arrival_seq(self.ready_prefills[0])
+        decode_seq = self._arrival_seq(self.ready_decodes[0])
+        if prefill_seq is None or decode_seq is None:
+            self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_DECODE
+            self._start_prefill_middle_throttle()
+            return self._build_batch(self.ready_prefills.popleft())
+        if decode_seq < prefill_seq:
+            logger.info(
+                "[PD-PASSIVE] Decode arrived before prefill slice-0: "
+                "decode_seq=%d, prefill_seq=%d",
+                decode_seq,
+                prefill_seq,
+            )
+            self._clear_prefill_middle_throttle()
+            return self._build_batch(self.ready_decodes.popleft())
+        logger.info(
+            "[PD-PASSIVE] Prefill slice-0 arrived before decode: "
+            "prefill_seq=%d, decode_seq=%d",
+            prefill_seq,
+            decode_seq,
+        )
+        self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_DECODE
+        self._start_prefill_middle_throttle()
+        return self._build_batch(self.ready_prefills.popleft())
+
     def _schedule_expect_alternation(self) -> ScheduledBatch:
         state = self.cloud_scheduling_state
         if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
@@ -514,6 +589,11 @@ class PassiveScheduler:
                 self._start_prefill_middle_throttle()
                 return self._build_active_prefill_slice_batch()
             if self.ready_prefills:
+                if (
+                    self.ready_decodes
+                    and self._ready_prefill_is_sliced_first_block()
+                ):
+                    return self._schedule_by_arrival()
                 self.cloud_scheduling_state = (
                     CloudSchedulingState.EXPECT_EXECUTE_DECODE
                 )
@@ -582,15 +662,17 @@ class PassiveScheduler:
     def _log_picked_batch(self, batch: ScheduledBatch) -> None:
         so = batch.scheduler_output
         logger.debug(
-            "PassiveScheduler.schedule[expect_alternation] picked "
-            "batch_type=%s slices=%d; pending=(prefills=%d, "
-            "active_prefill_slices=%d, pdmixes=%d, decodes=%d)",
+            "PassiveScheduler.schedule[%s] picked batch_type=%s slices=%d; "
+            "pending=(prefills=%d, active_prefill_slices=%d, "
+            "pdmixes=%d, decodes=%d) seq=%s",
+            self.dispatch_policy.value,
             so.batch_type.value if so.batch_type is not None else "<none>",
             len(batch.slices),
             len(self.ready_prefills),
             len(self._active_prefill_slices),
             len(self.ready_pdmixes),
             len(self.ready_decodes),
+            self._arrival_seq(so),
         )
 
     # ------------------------------------------------------------------ #

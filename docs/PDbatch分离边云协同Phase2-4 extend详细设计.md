@@ -243,16 +243,11 @@ def execute_model(self, scheduler_output, layer_slice_info=None):
 
 ```python
 def _execute_model_edge_head(self, scheduler_output):
-    """边侧 P/D 首：segment_a → isend(含 head_token) → 挂起 HeadState → 立即返回 EMPTY"""
+    """边侧 P/D 首：segment_a → isend hidden → 挂起 HeadState → 立即返回 EMPTY"""
     intermediate = self.model_runner.execute_model(
         scheduler_output, intermediate_tensors=None,
     )
     assert isinstance(intermediate, IntermediateTensors)
-    # 把 head_token 嵌入 intermediate tensors，供云侧原样回填到回传 hidden
-    token = scheduler_output.head_token
-    intermediate.tensors["_head_token"] = torch.tensor(
-        list(bytearray(token, "utf-8")), dtype=torch.uint8, device="npu",
-    )
     if get_pp_group().world_size == 2:
         self._pp_send_work = get_pp_group().isend_tensor_dict(intermediate.tensors)
     self.model_runner.suspend_head_state(scheduler_output)   # § 5.3
@@ -263,8 +258,8 @@ def _execute_model_edge_tail(self, scheduler_output):
     tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
     intermediate = AsyncIntermediateTensors(tensor_dict, comm_handles, comm_postprocess)
     torch.npu.synchronize()
-    # resume 内部做 control-plane vs data-plane head_token 一致性校验
-    self.model_runner.resume_head_state(scheduler_output, intermediate)   # § 5.3
+    # resume 内部基于控制面 head_token 恢复 HeadState；数据面对齐由调度和 hidden channel 保证
+    self.model_runner.resume_head_state(scheduler_output)   # § 5.3
     output = self.model_runner.execute_model(scheduler_output, intermediate)
     assert isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput))
     return output
@@ -385,34 +380,20 @@ def resume_head_state(
 ) -> HeadState:
     """P/D 尾段开始时调用。按 head_token 取出 HeadState 并做跨通道一致性校验。
 
-    控制面（ZMQ POST_OUT）与数据面（PP irecv_tensor_dict）是两条独立通道，
-    2P1D 场景下必须显式校验它们携带的是同一个 head_token，否则静默错配。
+    控制面（ZMQ POST_OUT）与数据面（PP irecv_tensor_dict）是两条独立通道。
+    调度与 hidden channel 保证数据面对齐；tail 侧用控制面 head_token 恢复 HeadState。
     """
     token_ctrl = scheduler_output.head_token
     assert token_ctrl, "PL/DL scheduler_output must carry head_token from cloud"
 
-    # ① 从 PP 数据面提取 token
-    token_tensor = intermediate_tensors.tensors.get("_head_token")
-    assert token_tensor is not None, (
-        "intermediate_tensors missing '_head_token'; cloud worker must embed it"
-    )
-    token_data = bytes(token_tensor.cpu().numpy().tolist())
-    token_pp = token_data.decode("utf-8")
-
-    # ② 跨通道一致性断言
-    assert token_ctrl == token_pp, (
-        f"Control-plane vs data-plane head_token mismatch: "
-        f"ZMQ={token_ctrl}, PP={token_pp}"
-    )
-
-    # ③ 按 token 从挂起池取出
+    # ① 按 token 从挂起池取出
     head_state = self._pending_head_states.pop(token_ctrl, None)
     assert head_state is not None, (
         f"No suspended HeadState for head_token={token_ctrl}; "
         f"tail dispatched without matching head or already consumed"
     )
 
-    # ④ batch_type 配对校验
+    # ② batch_type 配对校验
     expected_pair = self._expected_tail_batch_type(
         head_state.scheduler_output.batch_type,
     )
@@ -456,7 +437,7 @@ PL 不带张量、只是调度信号；hidden 不带调度信息、只是张量�
 
 #### 5.4.2 head_token 端到端贯穿
 
-2P1D 场景下，控制面（ZMQ）与数据面（PP）**可能乱序**，必须用全局唯一的 `head_token` 做端到端配对：
+2P1D 场景下，调度与 hidden channel 保证控制面（ZMQ）与数据面（PP）不错位；`head_token` 作为控制面全局唯一标识，用于 HeadState 与 hidden channel 生命周期管理：
 
 ```
 Edge EngineCore (step N)
@@ -465,21 +446,20 @@ Edge EngineCore (step N)
   │  ③ ZMQ PRE_OUT.publish(SO_PF)  ───────────► Cloud PassiveEC
   │                                              Cloud worker
   │  ④ execute_model(SO_PF)                      ⑤ recv hidden_a
-  │     segment_a ──► isend(hidden_a + _head_token) ⑥ segment_b/c
-  │     suspend_head_state(token)                ⑦ isend(hidden_e + _head_token)
+  │     segment_a ──► isend(hidden_a)             ⑥ segment_b/c
+  │     suspend_head_state(token)                ⑦ isend(hidden_e)
   │                                              ⑧ POST_OUT.publish(SO_PL + token)
   │  ⑨ _drain_pd_channel_inbox → SO_PL (含 token)
   │  ⑩ execute_model(SO_PL)
-  │        ⑪ broadcast_recv → hidden_e (含 _head_token)
-  │        ⑫ resume_head_state(SO_PL, hidden_e)
-  │              assert SO_PL.head_token == hidden_e._head_token
+  │        ⑪ broadcast_recv → hidden_e
+  │        ⑫ resume_head_state(SO_PL)
+  │              use SO_PL.head_token to pop HeadState
   │        ⑬ segment_e + sampler
 ```
 
-**三个 Embedding 点**：
+**两个控制面/运行时状态点**：
 1. **SchedulerOutput**：EngineCore 在生成 PF/DF 时预分配 `head_token`，随 PRE_OUT 发给云；云 PassiveEngineCore 在 POST_OUT 回传 PL/DL 时**原样回填**。
-2. **intermediate_tensors**：边 worker 在 segment_a 的 `isend_tensor_dict` payload 里附加 `_head_token` 张量（`torch.tensor(bytearray(token, "utf-8"), dtype=torch.uint8)`）；云 worker 在 segment_e 的 `isend_tensor_dict` 里**原样回填**同一 `_head_token`。
-3. **model_runner**：`suspend_head_state` 按 token 把 HeadState 存入 `_pending_head_states`；`resume_head_state` 从 PL scheduler_output 取控制面 token、从 `intermediate_tensors` 取数据面 token，做一致性断言后配对。
+2. **model_runner / HiddenChannelManager**：`suspend_head_state` 按 token 把 HeadState 存入 `_pending_head_states`；`resume_head_state` 从 PL scheduler_output 取控制面 token 并恢复对应 HeadState。Prefill hidden channel 也按 `head_token` 分配、校验和释放。
 
 #### 5.4.3 为什么必须是 head_token（而非 req_ids）
 
@@ -686,7 +666,7 @@ D 段沿用同一套机制，**不**需要额外代码：
 
 | 文件 | 改动类型 | 大致行数 | 说明 |
 |------|---------|---------|------|
-| `vllm-ascend-pdmix/vllm_ascend/worker/worker.py` | 重构 `execute_model` | +120 / -60 | 拆出 4 个子函数，按 batch_type 派发；isend 时嵌入 `_head_token` |
+| `vllm-ascend-pdmix/vllm_ascend/worker/worker.py` | 重构 `execute_model` | +120 / -60 | 拆出 4 个子函数，按 batch_type 派发；通过 hidden channel 传输 hidden tensors |
 | `vllm-ascend-pdmix/vllm_ascend/worker/model_runner_v1.py` | 新增 HeadState + suspend/resume | +80 | `_edge_cloud_forward_edge` 拆成 segment_a / segment_e 两段；`_pending_head_states` dict |
 | `vllm-pdmix/vllm/v1/engine/core.py` | `step_with_batch_queue` 加 batch_type 判定 + head_token 预分配 | +30 | `_needs_sample_tokens` 帮助方法；PF/DF 调度时预分配 `head_token` |
 | `vllm-pdmix/vllm/v1/core/scheduler.py` (或 SchedulerOutput 定义处) | 新增字段 | +2 | `SchedulerOutput` 新增 `head_token: str \| None = None` |
@@ -694,7 +674,7 @@ D 段沿用同一套机制，**不**需要额外代码：
 | `vllm-pdmix/vllm/v1/executor/multiproc_executor.py` | 不动 | 0 | 已回退 Fix B，保持原 worker_busy_loop |
 | `tests/v1/engine/test_step_with_batch_queue_edge_cloud.py` | 新增 | +150 | mock executor 验证 PF 不入 sample_tokens、PL 入 sample_tokens |
 | `tests/ascend/worker/test_worker_segment_dispatch.py` | 新增 | +200 | mock model_runner 验证 PF/PL/DF/DL/cloud 四类 batch 派发正确 |
-| `tests/ascend/worker/test_head_state_lifecycle.py` | 新增 | +200 | suspend/resume 配对、跨通道 token  mismatch assert、并发 2P1D 场景 |
+| `tests/ascend/worker/test_head_state_lifecycle.py` | 新增 | +200 | suspend/resume 配对、batch_type/req_ids mismatch assert、并发 2P1D 场景 |
 
 ---
 
@@ -771,11 +751,11 @@ curl http://<edge_ip>:8000/v1/completions \
 **本次 head_token 协议变更是前向兼容性破坏**：
 - `SchedulerOutput` 新增 `head_token` 字段
 - PRE_OUT / POST_OUT ZMQ 消息需携带 `head_token`
-- intermediate_tensors 张量字典新增 `_head_token` 字段
+- 数据面 `IntermediateTensors` 不携带调度 token，hidden tensors 通过 hidden channel 与调度保证对齐
 
 **升级要求**：
-- 云侧与边侧必须**同时升级**，不允许混跑（旧边 + 新云 或 新边 + 旧云 都会因缺失 head_token 触发 assert）
-- 若需灰度，建议先升级云侧（云侧被动消费 head_token，旧边不发送也能跑——但会失去跨通道校验），再升级边侧；或统一通过配置开关 `enable_head_token_pairing=False` 关闭校验做兼容过渡
+- 云侧与边侧必须**同时升级**，不允许混跑（旧边 + 新云 或 新边 + 旧云 都可能因控制面 `head_token` 字段/语义不一致触发 assert）
+- 若需灰度，建议先升级云侧（云侧被动消费控制面 head_token），再升级边侧
 
 ### 13.3 回滚策略
 

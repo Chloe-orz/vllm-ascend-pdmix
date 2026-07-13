@@ -19,10 +19,21 @@
 # This file supports hot-reload: modify and save while the service is
 # running; the next prefill batch will pick up the new config automatically.
 
-16: 24
-8: 10
-4: 4
-3: 6
-2: 5
-1: 5
-0: 5
+# Edge-side DECODE_LAST delay schedule time (milliseconds).
+# After DECODE_FIRST is picked, DECODE_LAST cannot be scheduled until
+# this delay has elapsed, giving Cloud DM + P2P transfer time to complete.
+# Default: 30 (ms).
+decode_last_delay_schedule_ms: 30
+
+# Cloud-side prefill-middle throttle: how long (in milliseconds) to wait for
+# a decode-middle batch before falling back to another prefill-middle slice.
+# Default: 10 (ms).
+prefill_middle_throttle_ms: 500
+
+16: 20
+8: 20
+4: 12
+3: 12
+2: 12
+1: 12
+0: 12
