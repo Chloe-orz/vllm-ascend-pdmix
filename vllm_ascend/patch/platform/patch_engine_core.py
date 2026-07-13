@@ -164,13 +164,14 @@ def _patched_engine_core_init(self, *args, **kwargs):
 # =======================================================================#
 def _drain_pd_channel_inbox(self) -> None:
     """Move cloud-returned SchedulerOutputs into the local PDSeparated
-    scheduler's ``prefills_last_ready`` / ``decodes_last_ready`` queues.
+    scheduler's tail ready queues.
     """
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     if not (
         hasattr(self.scheduler, "prefills_last_ready")
         and hasattr(self.scheduler, "decodes_last_ready")
+        and hasattr(self.scheduler, "mtp_drafts_last_ready")
     ):
         return
     new_outputs = self._pp_pd_channel.consume_new_outputs()
@@ -181,10 +182,12 @@ def _drain_pd_channel_inbox(self) -> None:
             self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
+        elif bt == BatchType.MTP_DRAFT_LAST:
+            self.scheduler.mtp_drafts_last_ready.append(so)
         else:
             logger.error(
                 "PD-separation POST_OUT received unexpected batch_type=%s; "
-                "expected PREFILL_LAST or DECODE_LAST. Dropping.",
+                "expected PREFILL_LAST, DECODE_LAST, or MTP_DRAFT_LAST. Dropping.",
                 bt.value if bt is not None else "<none>",
             )
 
@@ -240,7 +243,10 @@ def _publish_pre_out_when_ready(self) -> None:
         return
 
     _, oldest_so, _ = batch_queue[-1]
-    if oldest_so.batch_type != BatchType.PREFILL_FIRST:
+    if oldest_so.batch_type not in (
+        BatchType.PREFILL_FIRST,
+        BatchType.MTP_DRAFT_FIRST,
+    ):
         return
 
     head_token = getattr(oldest_so, "head_token", None)
@@ -257,9 +263,11 @@ def _publish_pre_out_when_ready(self) -> None:
     ch.publish(oldest_so)
     published.add(head_token)
     logger.info(
-        "[PRE_OUT] Published PREFILL_FIRST (head_token=%s) when it became next to execute, "
+        "[PRE_OUT] Published %s (head_token=%s) when it became next to execute, "
         "queue_len=%d",
-        head_token, len(batch_queue),
+        oldest_so.batch_type.value,
+        head_token,
+        len(batch_queue),
     )
 
 
@@ -438,7 +446,9 @@ def _patched_step_with_batch_queue(self):
         if (
             getattr(self, "_pp_pd_channel", None) is not None
             and scheduler_output.batch_type in (
-                BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST
+                BatchType.PREFILL_FIRST,
+                BatchType.DECODE_FIRST,
+                BatchType.MTP_DRAFT_FIRST,
             )
             and not getattr(scheduler_output, "head_token", None)
         ):
@@ -553,10 +563,15 @@ def _patched_step_with_batch_queue(self):
     if deferred_scheduler_output:
         if self.use_spec_decode:
             draft_token_ids = self.model_executor.take_draft_token_ids()
-            assert draft_token_ids is not None
-            self.scheduler.update_draft_token_ids_in_output(
-                draft_token_ids, deferred_scheduler_output
-            )
+            if draft_token_ids is not None:
+                self.scheduler.update_draft_token_ids_in_output(
+                    draft_token_ids, deferred_scheduler_output
+                )
+            else:
+                logger.debug(
+                    "Spec decode draft_token_ids are not ready yet; "
+                    "skip immediate scheduler draft-token update."
+                )
         grammar_output = self.scheduler.get_grammar_bitmask(
             deferred_scheduler_output
         )

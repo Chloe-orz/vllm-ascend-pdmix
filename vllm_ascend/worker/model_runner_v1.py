@@ -486,6 +486,7 @@ class NPUModelRunner(GPUModelRunner):
         # head_token.  Each entry holds the minimal context needed to verify
         # that a later tail-segment batch matches its head segment.
         self._pending_head_states: dict[str, "HeadState"] = {}
+        self._pending_mtp_draft_context: dict[str, Any] | None = None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2108,6 +2109,69 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _is_qwen_mtp_spec_decode(self) -> bool:
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return False
+        method = getattr(speculative_config, "method", None)
+        if method in ("qwen3_5_mtp", "qwen_mtp"):
+            return True
+        if method != "mtp":
+            return False
+        model_config = getattr(self.vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        model_type = str(getattr(hf_config, "model_type", "")).lower()
+        return "qwen" in model_type and "mtp" in model_type
+
+    def _should_defer_qwen_mtp_draft(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        return (
+            self._is_qwen_mtp_spec_decode()
+            and getattr(self, "_edge_cloud_enabled", False)
+            and is_edge_device()
+            and getattr(self, "drafter", None) is not None
+            and scheduler_output.batch_type in (
+                BatchType.PREFILL_LAST,
+                BatchType.DECODE_LAST,
+            )
+        )
+
+    def _stash_pending_mtp_draft_context(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: torch.Tensor | None,
+        sample_hidden_states: torch.Tensor | None,
+        batch_desc: BatchDescriptor | None,
+        use_padded_batch: bool,
+    ) -> None:
+        self._pending_mtp_draft_context = {
+            "scheduler_output": scheduler_output,
+            "sampled_token_ids": sampled_token_ids,
+            "sampling_metadata": self.input_batch.sampling_metadata,
+            "spec_decode_metadata": spec_decode_metadata,
+            "spec_decode_common_attn_metadata": spec_decode_common_attn_metadata,
+            "positions": positions,
+            "num_scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+            "hidden_states": hidden_states,
+            "aux_hidden_states": aux_hidden_states,
+            "sample_hidden_states": sample_hidden_states,
+            "target_model_batch_desc": batch_desc,
+            "use_padded_batch": use_padded_batch,
+            "req_ids": tuple(self.input_batch.req_ids),
+        }
+        self._draft_token_ids = None
+        logger.debug(
+            "Deferred Qwen-MTP draft after %s, req_ids=%s",
+            scheduler_output.batch_type,
+            self._pending_mtp_draft_context["req_ids"],
+        )
+
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
@@ -2879,11 +2943,36 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
-                if use_padded_batch:
+                defer_qwen_mtp_draft = self._should_defer_qwen_mtp_draft(
+                    scheduler_output
+                )
+                if defer_qwen_mtp_draft:
+                    sampled_token_ids = (
+                        sampler_output.sampled_token_ids
+                        if use_padded_batch
+                        else valid_sampled_token_ids
+                    )
+                    self._stash_pending_mtp_draft_context(
+                        scheduler_output,
+                        sampled_token_ids,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        positions,
+                        hidden_states,
+                        aux_hidden_states,
+                        sample_hidden_states,
+                        batch_desc,
+                        use_padded_batch,
+                    )
+                elif use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
+                if (
+                    self.speculative_config
+                    and not use_padded_batch
+                    and not defer_qwen_mtp_draft
+                ):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)

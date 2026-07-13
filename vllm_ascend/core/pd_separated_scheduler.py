@@ -36,8 +36,9 @@ class HiddenChannelManager:
     """Manages data-plane hidden tensor channels for edge-cloud PD separation.
 
     Two prefill channels (PREFILL_1 / PREFILL_2) support 2P1D; one decode
-    channel (DECODE) supports single in-flight decode. Channels are allocated
-    in FIFO order and freed when the tail segment completes.
+    channel (DECODE) supports verify decode; one MTP draft channel
+    (MTP_DRAFT) supports Qwen-MTP draft transfer. Prefill channels are
+    allocated in FIFO order and freed when the tail segment completes.
     """
 
     def __init__(self) -> None:
@@ -83,6 +84,10 @@ class HiddenChannelManager:
     def decode_channel() -> HiddenChannelType:
         return HiddenChannelType.DECODE
 
+    @staticmethod
+    def mtp_draft_channel() -> HiddenChannelType:
+        return HiddenChannelType.MTP_DRAFT
+
     # ------------------------------------------------------------------ #
     # Introspection                                                      #
     # ------------------------------------------------------------------ #
@@ -121,6 +126,8 @@ class PDSeparatedScheduler(Scheduler):
         # Populated by EngineCore.step() before calling self.schedule().
         self.prefills_last_ready: deque[SchedulerOutput] = deque()
         self.decodes_last_ready: deque[SchedulerOutput] = deque()
+        self.mtp_drafts_first_ready: deque[SchedulerOutput] = deque()
+        self.mtp_drafts_last_ready: deque[SchedulerOutput] = deque()
 
         self._step_counter: int = 0
 
@@ -131,6 +138,8 @@ class PDSeparatedScheduler(Scheduler):
         self.prefill_inflight_count: int = 0
         self.decode_inflight_limit: int = 1
         self.decode_inflight_count: int = 0
+        self.mtp_draft_inflight_limit: int = 1
+        self.mtp_draft_inflight_count: int = 0
 
         # Phase6 data-plane channel manager.  Two prefill hidden channels are
         # available for 2P1D; decode uses a dedicated fixed channel.
@@ -177,10 +186,7 @@ class PDSeparatedScheduler(Scheduler):
         return scheduler_output
 
     def _pick_by_state(self, state: PrefillState) -> SchedulerOutput:
-        # D尾必须无条件优先于 D首，防止 decode_inflight_count 在 D首
-        # 完成后立即释放导致 D尾 starvation。
         if state == PrefillState.IDLE:
-            # IDLE: P首/chunk0首 > D尾 > D首 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -194,14 +200,19 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
-            if self.decodes_last_ready and self._can_schedule_decode_last():
-                return self._pick_decode_last_batch()
+            if self.prefills_last_ready:
+                return self._pick_prefill_last_batch()
+            if self._can_schedule_mtp_draft_first():
+                return self._pick_mtp_draft_first_batch()
+            if self.mtp_drafts_last_ready:
+                return self._pick_mtp_draft_last_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
+            if self.decodes_last_ready and self._can_schedule_decode_last():
+                return self._pick_decode_last_batch()
             return self._make_empty_batch()
 
         if state == PrefillState.LOW:
-            # LOW: chunk/P首(when slot available) > D尾 > D首 > P尾 > Empty.
             if self._can_schedule_prefill_first():
                 so = self._pick_prefill_first_batch()
                 if so.total_num_scheduled_tokens > 0:
@@ -212,21 +223,29 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
-            if self.decodes_last_ready and self._can_schedule_decode_last():
-                return self._pick_decode_last_batch()
-            if self._can_schedule_decode_first():
-                return self._pick_decode_first_batch()
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
+            if self._can_schedule_mtp_draft_first():
+                return self._pick_mtp_draft_first_batch()
+            if self.mtp_drafts_last_ready:
+                return self._pick_mtp_draft_last_batch()
+            if self._can_schedule_decode_first():
+                return self._pick_decode_first_batch()
+            if self.decodes_last_ready and self._can_schedule_decode_last():
+                return self._pick_decode_last_batch()
             return self._make_empty_batch()
 
-        # HIGH: D尾 > D首 > P尾 > Empty. New P首 is forbidden.
-        if self.decodes_last_ready and self._can_schedule_decode_last():
-            return self._pick_decode_last_batch()
-        if self._can_schedule_decode_first():
-            return self._pick_decode_first_batch()
+        # HIGH forbids new P-first, but keeps the same ready-work priority.
         if self.prefills_last_ready:
             return self._pick_prefill_last_batch()
+        if self._can_schedule_mtp_draft_first():
+            return self._pick_mtp_draft_first_batch()
+        if self.mtp_drafts_last_ready:
+            return self._pick_mtp_draft_last_batch()
+        if self._can_schedule_decode_first():
+            return self._pick_decode_first_batch()
+        if self.decodes_last_ready and self._can_schedule_decode_last():
+            return self._pick_decode_last_batch()
         return self._make_empty_batch()
 
     def is_waiting_for_remote_tail(self) -> bool:
@@ -237,10 +256,16 @@ class PDSeparatedScheduler(Scheduler):
         instead of tight-loop scheduling EMPTY batches.
         """
         return bool(
-            (self.prefill_inflight_count > 0 or self.decode_inflight_count > 0)
+            (
+                self.prefill_inflight_count > 0
+                or self.decode_inflight_count > 0
+                or self.mtp_draft_inflight_count > 0
+            )
             and not self.prefills_last_ready
             and not self.decodes_last_ready
+            and not self.mtp_drafts_last_ready
             and not self._can_schedule_prefill_first()
+            and not self._can_schedule_mtp_draft_first()
             and not self._can_schedule_decode_first()
         )
 
@@ -277,6 +302,12 @@ class PDSeparatedScheduler(Scheduler):
             and not self._force_decode_last
         )
 
+    def _can_schedule_mtp_draft_first(self) -> bool:
+        return bool(
+            self.mtp_drafts_first_ready
+            and self.mtp_draft_inflight_count < self.mtp_draft_inflight_limit
+        )
+
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
         self._step_counter += 1
         logger.info(
@@ -286,8 +317,11 @@ class PDSeparatedScheduler(Scheduler):
             f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
             f"running[]: {len(self.running)}, "
             f"prefills_last_ready[]: {len(self.prefills_last_ready)}, "
+            f"mtp_drafts_first_ready[]: {len(self.mtp_drafts_first_ready)}, "
+            f"mtp_drafts_last_ready[]: {len(self.mtp_drafts_last_ready)}, "
             f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
             f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
+            f"mtp_draft_inflight: {self.mtp_draft_inflight_count}/{self.mtp_draft_inflight_limit}, "
             f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
         )
 
@@ -493,6 +527,15 @@ class PDSeparatedScheduler(Scheduler):
                 f"{scheduler_output.hidden_channel}"
             )
 
+    def _validate_mtp_draft_tail_channel(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        if scheduler_output.hidden_channel != HiddenChannelType.MTP_DRAFT:
+            raise RuntimeError(
+                "MTP_DRAFT_LAST expects MTP draft hidden channel, got "
+                f"{scheduler_output.hidden_channel}"
+            )
+
     def _pick_decode_last_batch(self) -> SchedulerOutput:
         if not self.decodes_last_ready:
             return self._make_empty_batch()
@@ -502,6 +545,29 @@ class PDSeparatedScheduler(Scheduler):
         )
         self._validate_decode_tail_channel(so)
         self._force_decode_last = False
+        return so
+
+    def _pick_mtp_draft_first_batch(self) -> SchedulerOutput:
+        if not self.mtp_drafts_first_ready:
+            return self._make_empty_batch()
+        so = self.mtp_drafts_first_ready.popleft()
+        so.batch_type = BatchType.MTP_DRAFT_FIRST
+        if so.head_token is None:
+            so.head_token = uuid4().hex
+        so.hidden_channel = self.hidden_channel_manager.mtp_draft_channel()
+        self.mtp_draft_inflight_count += 1
+        return so
+
+    def _pick_mtp_draft_last_batch(self) -> SchedulerOutput:
+        if not self.mtp_drafts_last_ready:
+            return self._make_empty_batch()
+        so = self.mtp_drafts_last_ready.popleft()
+        assert so.batch_type == BatchType.MTP_DRAFT_LAST, (
+            f"mtp_drafts_last_ready expects MTP_DRAFT_LAST, got {so.batch_type}"
+        )
+        self._validate_mtp_draft_tail_channel(so)
+        if self.mtp_draft_inflight_count > 0:
+            self.mtp_draft_inflight_count -= 1
         return so
 
     def _ensure_cached_all_token_ids(

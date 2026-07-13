@@ -568,8 +568,10 @@ class NPUWorker(WorkerBase):
             if bt in (
                 BatchType.PREFILL_FIRST,
                 BatchType.DECODE_FIRST,
+                BatchType.MTP_DRAFT_FIRST,
                 BatchType.PREFILL_LAST,
                 BatchType.DECODE_LAST,
+                BatchType.MTP_DRAFT_LAST,
             ):
                 self._wait_pp_send_work(self._hidden_channel_for(scheduler_output))
             else:
@@ -607,6 +609,8 @@ class NPUWorker(WorkerBase):
             return HiddenChannelType.PREFILL_1
         if bt in (BatchType.DECODE_FIRST, BatchType.DECODE_LAST):
             return HiddenChannelType.DECODE
+        if bt in (BatchType.MTP_DRAFT_FIRST, BatchType.MTP_DRAFT_LAST):
+            return HiddenChannelType.MTP_DRAFT
         raise RuntimeError(f"No hidden channel for batch_type={bt}")
 
     def _execute_model_edge_head(

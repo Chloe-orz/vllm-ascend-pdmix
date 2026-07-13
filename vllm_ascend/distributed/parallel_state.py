@@ -701,6 +701,11 @@ def _get_edge_cloud_hidden_channel_device_group(
                 "Call create_alternate_groups() first."
             )
             return pp_group.alt_device_group
+        if channel == HiddenChannelType.MTP_DRAFT:
+            raise RuntimeError(
+                "MTP_DRAFT hidden channel requires "
+                "create_hidden_channel_groups()"
+            )
         raise RuntimeError(
             "PREFILL_2 hidden channel requires create_hidden_channel_groups()"
         )
@@ -1109,6 +1114,23 @@ def edge_cloud_send_tensor_dict(
         channel=channel,
         num_tokens=num_tokens,
     )
+
+
+def edge_cloud_send_tensor_dict_mtp(
+    tensor_dict: dict[str, torch.Tensor | Any],
+    channel: HiddenChannelType = HiddenChannelType.MTP_DRAFT,
+) -> list[Handle]:
+    """Send Qwen-MTP draft tensors with metadata on the MTP hidden channel."""
+    pp_group = get_pp_group()
+    if hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
+        return pp_group.isend_tensor_dict_on_hidden_channel(
+            tensor_dict,
+            dst=None,
+            channel=channel,
+        )
+    return pp_group.isend_tensor_dict(tensor_dict)
+
+
 def _apply_sp_chunk_inplace(tensor_dict: dict[str, Any]) -> None:
     """Sequence-parallel chunk each tensor in ``tensor_dict`` along dim 0.
 
@@ -1288,6 +1310,99 @@ def edge_cloud_broadcast_recv(
             handles.append(
                 torch.distributed.broadcast(
                     tensor, src=tp_group.ranks[0], group=group, async_op=True
+                )
+            )
+        for handle in handles:
+            handle.wait()
+
+    return recv_tensor_dict, [], [broadcast_postprocess]
+
+
+def edge_cloud_broadcast_recv_mtp(
+    channel: HiddenChannelType = HiddenChannelType.MTP_DRAFT,
+) -> tuple[
+    dict[str, torch.Tensor | Any] | None,
+    list[Handle],
+    list[Callable[[], None]],
+]:
+    """Receive Qwen-MTP draft tensors on the MTP hidden channel.
+
+    Qwen-MTP draft steps carry dynamic per-step payload such as positions and
+    spec_step_idx, so they use the metadata-exchanging PP tensor_dict path
+    instead of the fixed EdgeCloudTensorMeta fast path used by P/D hidden
+    transfers.
+    """
+    pp_group = get_pp_group()
+    tp_group = get_tp_group()
+    is_pp_npu0 = pp_group.world_size == 2
+
+    if is_pp_npu0:
+        if hasattr(pp_group, "irecv_tensor_dict_on_hidden_channel"):
+            tensor_dict, comm_handles, comm_postprocess = (
+                pp_group.irecv_tensor_dict_on_hidden_channel(
+                    src=None,
+                    channel=channel,
+                )
+            )
+        else:
+            tensor_dict, comm_handles, comm_postprocess = (
+                pp_group.irecv_tensor_dict()
+            )
+        assert tensor_dict is not None, (
+            "edge_cloud_broadcast_recv_mtp: PP tensor_dict is None, "
+            "sender may have failed."
+        )
+
+        metadata_list, _ = _split_tensor_dict(tensor_dict)
+        tp_group.broadcast_object(metadata_list, src=0)
+
+        def broadcast_postprocess():
+            _, tensor_list = (
+                _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
+            )
+            handles = []
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+                handles.append(
+                    torch.distributed.broadcast(
+                        tensor,
+                        src=tp_group.ranks[0],
+                        group=group,
+                        async_op=True,
+                    )
+                )
+            for handle in handles:
+                handle.wait()
+
+        comm_postprocess.append(broadcast_postprocess)
+        return tensor_dict, comm_handles, comm_postprocess
+
+    metadata_list = tp_group.broadcast_object(None, src=0)
+    if metadata_list is None:
+        metadata_list = []
+    recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
+
+    for key, value in metadata_list:
+        if isinstance(value, TensorMetadata):
+            tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+            recv_tensor_dict[key] = tensor
+        else:
+            recv_tensor_dict[key] = value
+
+    def broadcast_postprocess():
+        handles = []
+        for tensor in recv_tensor_dict.values():
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+                continue
+            group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+            handles.append(
+                torch.distributed.broadcast(
+                    tensor,
+                    src=tp_group.ranks[0],
+                    group=group,
+                    async_op=True,
                 )
             )
         for handle in handles:

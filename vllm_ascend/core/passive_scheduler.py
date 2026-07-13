@@ -134,6 +134,7 @@ class PassiveScheduler:
         # `pp_subscriber.consume_new_outputs()` and pushes each SchedulerOutput
         # into `_inbox`; `poll_and_classify` drains `_inbox` instead of
         # touching the subscriber directly.
+        self.ready_mtp_drafts: deque[SchedulerOutput] = deque()
         self._inbox: queue.Queue[tuple[int, SchedulerOutput]] = queue.Queue()
         self._subscriber_thread: threading.Thread | None = None
         self._shutdown_event = threading.Event()
@@ -267,6 +268,8 @@ class PassiveScheduler:
                 # legacy PURE_PREFILL batch (run middle layers, send hidden
                 # state back), so route into the same ready queue.
                 self.ready_prefills.append(scheduler_output)
+            elif bt == BatchType.MTP_DRAFT_FIRST:
+                self.ready_mtp_drafts.append(scheduler_output)
             elif bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
                 # Same reasoning as above for decode head segments.
                 now = time.monotonic()
@@ -278,7 +281,11 @@ class PassiveScheduler:
                     )
                 self._last_decode_first_arrival_ts = now
                 self.ready_decodes.append(scheduler_output)
-            elif bt in (BatchType.PREFILL_LAST, BatchType.DECODE_LAST):
+            elif bt in (
+                BatchType.PREFILL_LAST,
+                BatchType.DECODE_LAST,
+                BatchType.MTP_DRAFT_LAST,
+            ):
                 # Tail-segment batches are edge-only and must never be
                 # dispatched on the cloud. If one shows up here it is a
                 # routing bug at the publisher side — drop with a loud log.
@@ -292,11 +299,12 @@ class PassiveScheduler:
                 self.ready_pdmixes.append(scheduler_output)
             logger.debug(
                 "PassiveScheduler classified seq=%s batch_type=%s "
-                "(prefills=%d, pdmixes=%d, decodes=%d)",
+                "(prefills=%d, pdmixes=%d, mtp_drafts=%d, decodes=%d)",
                 self._arrival_seq(scheduler_output),
                 bt.value if bt is not None else "<none>",
                 len(self.ready_prefills),
                 len(self.ready_pdmixes),
+                len(self.ready_mtp_drafts),
                 len(self.ready_decodes),
             )
 
@@ -455,6 +463,7 @@ class PassiveScheduler:
         if so.batch_type in (
             BatchType.PURE_DECODE,
             BatchType.DECODE_FIRST,
+            BatchType.MTP_DRAFT_FIRST,
         ):
             return [None]
 
@@ -580,53 +589,31 @@ class PassiveScheduler:
         return self._build_batch(self.ready_prefills.popleft())
 
     def _schedule_expect_alternation(self) -> ScheduledBatch:
-        state = self.cloud_scheduling_state
-        if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
-            if self._active_prefill_slices:
-                self.cloud_scheduling_state = (
-                    CloudSchedulingState.EXPECT_EXECUTE_DECODE
-                )
-                self._start_prefill_middle_throttle()
-                return self._build_active_prefill_slice_batch()
-            if self.ready_prefills:
-                if (
-                    self.ready_decodes
-                    and self._ready_prefill_is_sliced_first_block()
-                ):
-                    return self._schedule_by_arrival()
-                self.cloud_scheduling_state = (
-                    CloudSchedulingState.EXPECT_EXECUTE_DECODE
-                )
-                self._start_prefill_middle_throttle()
-                return self._build_batch(self.ready_prefills.popleft())
-            if self.ready_decodes:
-                self._clear_prefill_middle_throttle()
-                return self._build_batch(self.ready_decodes.popleft())
-        else:
-            if self.ready_decodes:
-                self.cloud_scheduling_state = (
-                    CloudSchedulingState.EXPECT_EXECUTE_PREFILL
-                )
-                self._clear_prefill_middle_throttle()
-                return self._build_batch(self.ready_decodes.popleft())
-            if self._can_fallback_to_prefill_in_decode_state():
-                if self._active_prefill_slices:
-                    self._start_prefill_middle_throttle()
-                    return self._build_active_prefill_slice_batch()
-                if self.ready_prefills:
-                    self._start_prefill_middle_throttle()
-                    return self._build_batch(self.ready_prefills.popleft())
-            else:
-                return ScheduledBatch.empty()
-
+        if self._active_prefill_slices:
+            self.cloud_scheduling_state = (
+                CloudSchedulingState.EXPECT_EXECUTE_DECODE
+            )
+            self._start_prefill_middle_throttle()
+            return self._build_active_prefill_slice_batch()
+        if self.ready_prefills:
+            self.cloud_scheduling_state = (
+                CloudSchedulingState.EXPECT_EXECUTE_DECODE
+            )
+            self._start_prefill_middle_throttle()
+            return self._build_batch(self.ready_prefills.popleft())
+        if self.ready_mtp_drafts:
+            self.cloud_scheduling_state = (
+                CloudSchedulingState.EXPECT_EXECUTE_PREFILL
+            )
+            self._clear_prefill_middle_throttle()
+            return self._build_batch(self.ready_mtp_drafts.popleft())
+        if self.ready_decodes:
+            self.cloud_scheduling_state = (
+                CloudSchedulingState.EXPECT_EXECUTE_PREFILL
+            )
+            self._clear_prefill_middle_throttle()
+            return self._build_batch(self.ready_decodes.popleft())
         if self.ready_pdmixes:
-            if (
-                state == CloudSchedulingState.EXPECT_EXECUTE_DECODE
-                and not self._can_fallback_to_prefill_in_decode_state()
-            ):
-                return ScheduledBatch.empty()
-            if state == CloudSchedulingState.EXPECT_EXECUTE_DECODE:
-                self._start_prefill_middle_throttle()
             return self._build_batch(self.ready_pdmixes.popleft())
         return ScheduledBatch.empty()
 
@@ -664,13 +651,14 @@ class PassiveScheduler:
         logger.debug(
             "PassiveScheduler.schedule[%s] picked batch_type=%s slices=%d; "
             "pending=(prefills=%d, active_prefill_slices=%d, "
-            "pdmixes=%d, decodes=%d) seq=%s",
+            "pdmixes=%d, mtp_drafts=%d, decodes=%d) seq=%s",
             self.dispatch_policy.value,
             so.batch_type.value if so.batch_type is not None else "<none>",
             len(batch.slices),
             len(self.ready_prefills),
             len(self._active_prefill_slices),
             len(self.ready_pdmixes),
+            len(self.ready_mtp_drafts),
             len(self.ready_decodes),
             self._arrival_seq(so),
         )
@@ -683,6 +671,7 @@ class PassiveScheduler:
             self.ready_prefills
             or self._active_prefill_slices
             or self.ready_pdmixes
+            or self.ready_mtp_drafts
             or self.ready_decodes
         )
 
@@ -692,5 +681,6 @@ class PassiveScheduler:
             len(self.ready_prefills)
             + len(self._active_prefill_slices)
             + len(self.ready_pdmixes)
+            + len(self.ready_mtp_drafts)
             + len(self.ready_decodes)
         )
