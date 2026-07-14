@@ -430,7 +430,7 @@ head_token: str
 parent_head_token: str | None
 draft_task_id: str
 draft_step_idx: int
-hidden_channel: HiddenChannelType.MTP_DRAFT
+hidden_channel: HiddenChannelType.DECODE
 ```
 
 字段含义：
@@ -441,7 +441,7 @@ hidden_channel: HiddenChannelType.MTP_DRAFT
 | `parent_head_token` | 触发该 draft 的 `P_LAST` 或 `VERIFY_DECODE_LAST` token |
 | `draft_task_id` | draft task 唯一 id |
 | `draft_step_idx` | `0..num_speculative_tokens-1` |
-| `hidden_channel` | 独立 MTP draft 数据通道 |
+| `hidden_channel` | 首版复用 `DECODE` 数据通道，MTP 语义由 `batch_type` 与 draft 控制面字段区分 |
 
 ## 6.3 云侧 batch 分类
 
@@ -565,26 +565,18 @@ num_speculative_tokens=3 时单轮 draft 总通信耗时
 
 ## 7.6 通信组与 channel 隔离
 
-建议新增：
+首版不新增 `HiddenChannelType.MTP_DRAFT`，MTP_DRAFT 复用现有 `HiddenChannelType.DECODE` 数据通道。
 
-```python
-HiddenChannelType.MTP_DRAFT
-```
+原因是当前 PD 掩盖框架新增 hidden channel 会带来额外通信组和显存成本，而 Qwen-MTP 首版目标是先打通 `draft -> verify` 的严格串行语义。`BatchType` 决定执行 MTP 还是主模型 verify，`hidden_channel` 只决定 hidden tensor 走哪个数据通道。
 
-不建议无保护复用 `HiddenChannelType.DECODE`，原因：
-
-1. `DECODE` channel 已服务主模型 verify。
-2. Qwen-MTP draft 有独立首尾生命周期。
-3. 复用容易导致 `head_token` 数据面错配。
-4. 复用会让 draft send/recv handle 反向阻塞 verify 尾段处理。
-
-首版可以复用同一个 PP group，但需要独立：
+复用 `DECODE` channel 时必须保留以下隔离：
 
 ```text
 send handle 管理
 head_token namespace
 MTPDraftState dict
-hidden channel 标识
+batch_type 标识
+mtp_draft_task_id / draft_step_idx
 日志和统计字段
 ```
 
@@ -967,7 +959,7 @@ VERIFY_DECODE_LAST:
 | 控制面和数据面乱序 | POST_OUT 先到，但 PP hidden 对不上 | `head_token == _head_token` 强校验 |
 | MTP_DRAFT_LAST 假 ready | 控制面到达但 hidden 未到，边侧阻塞等待 | 推荐 MTP_DRAFT_LAST 在 cloud middle 完成并发起 isend 后 POST_OUT |
 | metadata RTT 放大 | `num_speculative_tokens=3` 会产生多次小包往返 | 采集 metadata 阻塞时间，后续考虑 schema 缓存 |
-| channel 串包 | 复用 DECODE channel 容易和 verify 混淆 | 新增 `HiddenChannelType.MTP_DRAFT` |
+| channel 串包 | MTP_DRAFT 复用 DECODE channel，容易和 verify 混淆 | `BatchType` + `head_token` + `mtp_draft_task_id` + `draft_step_idx` 校验，并限制 DECODE channel 首段发送槽位 |
 | 多请求 draft 并发乱序 | 多个 MTP task 同时在飞，last 回来顺序不固定 | head_token + draft_task_id + draft_step_idx 三重校验 |
 | abort 后回包到达 | request 已取消，draft hidden 或控制面仍返回 | 回填前校验 request，清理 stale state |
 | send handle 等待阻塞 | 等待 draft send handle 影响 P/D 尾段处理 | MTP_DRAFT 独立 send handle，避免等待所有 channel |
@@ -1103,10 +1095,9 @@ DECODE_FIRST/DECODE_MIDDLE/DECODE_LAST  # semantic VERIFY_DECODE
 |---|---|---|
 | draft 阻塞边侧尾段处理 | 若仍在 `sample_tokens()` 内同步跑完整 Qwen-MTP draft，会卡住其他尾段任务 | 拆成 `MTP_DRAFT` 派生任务 |
 | 首轮 draft 触发点遗漏 | 只从 `VERIFY_LAST` 触发会漏掉 `P_LAST` 后的首轮 draft | `P_LAST` 和 `VERIFY_LAST` 都需要能创建 draft task |
-| channel 错配 | MTP draft 复用 DECODE channel 容易和主 verify 串包 | 新增 `MTP_DRAFT` channel |
-| draft miss | draft 未及时 ready，下一轮 verify 只能 width=1 | 首版允许统计，后续优化优先级和 in-flight |
+| channel 错配 | MTP draft 复用 DECODE channel 容易和主 verify 串包 | `BatchType/head_token/mtp_draft_task_id/draft_step_idx` 校验，并限制 DECODE channel 首段发送槽位 |
+| draft miss | draft 未及时 ready，下一轮 verify 不能按 width=1 退化 | 首版采用严格 MTP，下一轮 verify 等待 draft ready |
 | 多 step 通信放大 | `num_speculative_tokens=3` 会有 3 次 draft 往返 | 串行 step 先保证正确性，再评估合并 |
 | Graph/metadata stale | Qwen-MTP cloud attention metadata 依赖 positions/spec_step_idx | 复用来源刷新逻辑，step 维度显式传递 |
 | abort stale result | 请求取消后 draft 才返回 | 回填前校验 request id / generation |
 | MTP_DRAFT 控制面早到 | 边侧优先执行 MTP_DRAFT_LAST 但 hidden 未到 | 推荐 data-ready 后 POST_OUT 或记录等待时间 |
-

@@ -35,10 +35,10 @@ class PrefillState(enum.Enum):
 class HiddenChannelManager:
     """Manages data-plane hidden tensor channels for edge-cloud PD separation.
 
-    Two prefill channels (PREFILL_1 / PREFILL_2) support 2P1D; one decode
-    channel (DECODE) supports verify decode; one MTP draft channel
-    (MTP_DRAFT) supports Qwen-MTP draft transfer. Prefill channels are
-    allocated in FIFO order and freed when the tail segment completes.
+    Two prefill channels (PREFILL_1 / PREFILL_2) support 2P1D.  Verify
+    decode and Qwen-MTP draft both reuse the single DECODE hidden channel.
+    Prefill channels are allocated in FIFO order and freed when the tail
+    segment completes.
     """
 
     def __init__(self) -> None:
@@ -83,10 +83,6 @@ class HiddenChannelManager:
     @staticmethod
     def decode_channel() -> HiddenChannelType:
         return HiddenChannelType.DECODE
-
-    @staticmethod
-    def mtp_draft_channel() -> HiddenChannelType:
-        return HiddenChannelType.MTP_DRAFT
 
     # ------------------------------------------------------------------ #
     # Introspection                                                      #
@@ -299,6 +295,7 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             self.running
             and self.decode_inflight_count < self.decode_inflight_limit
+            and self.mtp_draft_inflight_count == 0
             and not self._force_decode_last
         )
 
@@ -306,6 +303,7 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             self.mtp_drafts_first_ready
             and self.mtp_draft_inflight_count < self.mtp_draft_inflight_limit
+            and self.decode_inflight_count == 0
         )
 
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
@@ -530,9 +528,9 @@ class PDSeparatedScheduler(Scheduler):
     def _validate_mtp_draft_tail_channel(
         self, scheduler_output: SchedulerOutput
     ) -> None:
-        if scheduler_output.hidden_channel != HiddenChannelType.MTP_DRAFT:
+        if scheduler_output.hidden_channel != HiddenChannelType.DECODE:
             raise RuntimeError(
-                "MTP_DRAFT_LAST expects MTP draft hidden channel, got "
+                "MTP_DRAFT_LAST expects decode hidden channel, got "
                 f"{scheduler_output.hidden_channel}"
             )
 
@@ -554,7 +552,7 @@ class PDSeparatedScheduler(Scheduler):
         so.batch_type = BatchType.MTP_DRAFT_FIRST
         if so.head_token is None:
             so.head_token = uuid4().hex
-        so.hidden_channel = self.hidden_channel_manager.mtp_draft_channel()
+        so.hidden_channel = self.hidden_channel_manager.decode_channel()
         self.mtp_draft_inflight_count += 1
         return so
 
@@ -566,8 +564,6 @@ class PDSeparatedScheduler(Scheduler):
             f"mtp_drafts_last_ready expects MTP_DRAFT_LAST, got {so.batch_type}"
         )
         self._validate_mtp_draft_tail_channel(so)
-        if self.mtp_draft_inflight_count > 0:
-            self.mtp_draft_inflight_count -= 1
         return so
 
     def _ensure_cached_all_token_ids(
@@ -745,6 +741,16 @@ class PDSeparatedScheduler(Scheduler):
             logger.info(
                 f"[PD] update_from_output DECODE_FIRST done, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
+            )
+        if scheduler_output.batch_type == BatchType.MTP_DRAFT_FIRST:
+            # MTP_DRAFT reuses the single DECODE hidden channel.  Like
+            # DECODE_FIRST, release the head-send slot once the first segment
+            # has completed and the hidden payload is handed to the data plane.
+            if self.mtp_draft_inflight_count > 0:
+                self.mtp_draft_inflight_count -= 1
+            logger.info(
+                f"[PD] update_from_output MTP_DRAFT_FIRST done, "
+                f"mtp_draft_inflight: {self.mtp_draft_inflight_count}/{self.mtp_draft_inflight_limit}",
             )
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
             # decode_inflight_count 已在 DECODE_FIRST 的 update_from_output

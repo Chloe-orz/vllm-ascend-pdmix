@@ -39,7 +39,7 @@ def _vllm_pd_scheduler_schema_available() -> bool:
     if any(not hasattr(BatchType, name) for name in required_batch_types):
         return False
 
-    required_channels = ("PREFILL_1", "PREFILL_2", "DECODE", "MTP_DRAFT")
+    required_channels = ("PREFILL_1", "PREFILL_2", "DECODE")
     if any(not hasattr(HiddenChannelType, name) for name in required_channels):
         return False
 

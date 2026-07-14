@@ -175,11 +175,9 @@ class GroupCoordinatorPatch(GroupCoordinator):
             self.alt_cpu_group: torch.distributed.ProcessGroup | None = None
             # Phase6 hidden data-plane channels. The default device/cpu groups
             # are PREFILL_1, the legacy alt groups are DECODE, and the extra
-            # hidden groups below are PREFILL_2 and MTP_DRAFT.
+            # hidden group below is PREFILL_2.
             self.prefill2_device_group: torch.distributed.ProcessGroup | None = None
             self.prefill2_cpu_group: torch.distributed.ProcessGroup | None = None
-            self.mtp_draft_device_group: torch.distributed.ProcessGroup | None = None
-            self.mtp_draft_cpu_group: torch.distributed.ProcessGroup | None = None
 
             self.device = torch.npu.current_device()
             if use_device_communicator and self.world_size > 1:
@@ -299,17 +297,14 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self,
         torch_distributed_backend: str | Backend,
     ) -> None:
-        """Create the extra Phase6 PREFILL_2 and MTP_DRAFT groups.
+        """Create the extra Phase6 PREFILL_2 group.
 
         The default pp group is PREFILL_1 and the existing alternate group is
-        DECODE.  This method adds PREFILL_2 and MTP_DRAFT as independent
-        data-plane channels over the same ranks.
+        DECODE.  This method adds PREFILL_2 as an independent data-plane
+        channel over the same ranks.
         """
         assert self.prefill2_device_group is None, (
             "PREFILL_2 hidden channel group already created"
-        )
-        assert self.mtp_draft_device_group is None, (
-            "MTP_DRAFT hidden channel group already created"
         )
         hccl_pg_options = create_hccl_pg_options("pp_prefill2")
         prefill2_device_group = None
@@ -329,24 +324,6 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self.prefill2_device_group = prefill2_device_group
         self.prefill2_cpu_group = prefill2_cpu_group
 
-        hccl_pg_options = create_hccl_pg_options("pp_mtp_draft")
-        mtp_draft_device_group = None
-        mtp_draft_cpu_group = None
-        for ranks in self._all_group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks,
-                backend=torch_distributed_backend,
-                pg_options=hccl_pg_options,
-            )
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                mtp_draft_device_group = device_group
-                mtp_draft_cpu_group = cpu_group
-        assert mtp_draft_device_group is not None
-        assert mtp_draft_cpu_group is not None
-        self.mtp_draft_device_group = mtp_draft_device_group
-        self.mtp_draft_cpu_group = mtp_draft_cpu_group
-
     def _hidden_channel_groups(self, channel: Any):
         value = getattr(channel, "value", channel)
         if value == "prefill_1":
@@ -359,10 +336,6 @@ class GroupCoordinatorPatch(GroupCoordinator):
             assert self.prefill2_device_group is not None
             assert self.prefill2_cpu_group is not None
             return self.prefill2_device_group, self.prefill2_cpu_group
-        if value == "mtp_draft":
-            assert self.mtp_draft_device_group is not None
-            assert self.mtp_draft_cpu_group is not None
-            return self.mtp_draft_device_group, self.mtp_draft_cpu_group
         raise ValueError(f"Unknown hidden channel: {channel}")
 
     def send_object_on_hidden_channel(

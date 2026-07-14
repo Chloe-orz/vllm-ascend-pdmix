@@ -2562,7 +2562,7 @@ class NPUModelRunner(GPUModelRunner):
             context["scheduler_output"],
             batch_type=BatchType.MTP_DRAFT_FIRST,
             head_token=None,
-            hidden_channel=HiddenChannelType.MTP_DRAFT,
+            hidden_channel=HiddenChannelType.DECODE,
             parent_req_id=req_ids[0],
             mtp_draft_task_id=task_id,
             draft_step_idx=draft_step_idx,

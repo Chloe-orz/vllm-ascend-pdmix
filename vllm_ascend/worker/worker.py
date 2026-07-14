@@ -620,7 +620,7 @@ class NPUWorker(WorkerBase):
         if bt in (BatchType.DECODE_FIRST, BatchType.DECODE_LAST):
             return HiddenChannelType.DECODE
         if bt in (BatchType.MTP_DRAFT_FIRST, BatchType.MTP_DRAFT_LAST):
-            return HiddenChannelType.MTP_DRAFT
+            return HiddenChannelType.DECODE
         raise RuntimeError(f"No hidden channel for batch_type={bt}")
 
     def _execute_model_edge_head(

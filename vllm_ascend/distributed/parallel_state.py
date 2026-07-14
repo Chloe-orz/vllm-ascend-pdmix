@@ -701,11 +701,6 @@ def _get_edge_cloud_hidden_channel_device_group(
                 "Call create_alternate_groups() first."
             )
             return pp_group.alt_device_group
-        if channel == HiddenChannelType.MTP_DRAFT:
-            raise RuntimeError(
-                "MTP_DRAFT hidden channel requires "
-                "create_hidden_channel_groups()"
-            )
         raise RuntimeError(
             "PREFILL_2 hidden channel requires create_hidden_channel_groups()"
         )
@@ -1118,9 +1113,9 @@ def edge_cloud_send_tensor_dict(
 
 def edge_cloud_send_tensor_dict_mtp(
     tensor_dict: dict[str, torch.Tensor | Any],
-    channel: HiddenChannelType = HiddenChannelType.MTP_DRAFT,
+    channel: HiddenChannelType = HiddenChannelType.DECODE,
 ) -> list[Handle]:
-    """Send Qwen-MTP draft tensors with metadata on the MTP hidden channel."""
+    """Send Qwen-MTP draft tensors with dynamic metadata."""
     pp_group = get_pp_group()
     if hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
         return pp_group.isend_tensor_dict_on_hidden_channel(
@@ -1319,13 +1314,13 @@ def edge_cloud_broadcast_recv(
 
 
 def edge_cloud_broadcast_recv_mtp(
-    channel: HiddenChannelType = HiddenChannelType.MTP_DRAFT,
+    channel: HiddenChannelType = HiddenChannelType.DECODE,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive Qwen-MTP draft tensors on the MTP hidden channel.
+    """Receive Qwen-MTP draft tensors with dynamic metadata.
 
     Qwen-MTP draft steps carry dynamic per-step payload such as positions and
     spec_step_idx, so they use the metadata-exchanging PP tensor_dict path
