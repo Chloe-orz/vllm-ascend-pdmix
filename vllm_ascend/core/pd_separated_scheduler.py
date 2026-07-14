@@ -16,7 +16,6 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import BatchType, HiddenChannelType, SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -136,6 +135,7 @@ class PDSeparatedScheduler(Scheduler):
         self.decode_inflight_count: int = 0
         self.mtp_draft_inflight_limit: int = 1
         self.mtp_draft_inflight_count: int = 0
+        self.mtp_draft_remote_pending_count: int = 0
 
         # Phase6 data-plane channel manager.  Two prefill hidden channels are
         # available for 2P1D; decode uses a dedicated fixed channel.
@@ -176,6 +176,7 @@ class PDSeparatedScheduler(Scheduler):
         is_tail = scheduler_output.batch_type in (
             BatchType.PREFILL_LAST,
             BatchType.DECODE_LAST,
+            BatchType.MTP_DRAFT_LAST,
         )
         if has_work or is_tail:
             self._log_scheduler_state(state, scheduler_output.batch_type)
@@ -256,6 +257,7 @@ class PDSeparatedScheduler(Scheduler):
                 self.prefill_inflight_count > 0
                 or self.decode_inflight_count > 0
                 or self.mtp_draft_inflight_count > 0
+                or self.mtp_draft_remote_pending_count > 0
             )
             and not self.prefills_last_ready
             and not self.decodes_last_ready
@@ -296,6 +298,9 @@ class PDSeparatedScheduler(Scheduler):
             self.running
             and self.decode_inflight_count < self.decode_inflight_limit
             and self.mtp_draft_inflight_count == 0
+            and self.mtp_draft_remote_pending_count == 0
+            and not self.mtp_drafts_first_ready
+            and not self.mtp_drafts_last_ready
             and not self._force_decode_last
         )
 
@@ -320,6 +325,7 @@ class PDSeparatedScheduler(Scheduler):
             f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
             f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
             f"mtp_draft_inflight: {self.mtp_draft_inflight_count}/{self.mtp_draft_inflight_limit}, "
+            f"mtp_draft_remote_pending: {self.mtp_draft_remote_pending_count}, "
             f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
         )
 
@@ -554,6 +560,7 @@ class PDSeparatedScheduler(Scheduler):
             so.head_token = uuid4().hex
         so.hidden_channel = self.hidden_channel_manager.decode_channel()
         self.mtp_draft_inflight_count += 1
+        self.mtp_draft_remote_pending_count += 1
         return so
 
     def _pick_mtp_draft_last_batch(self) -> SchedulerOutput:
@@ -565,6 +572,54 @@ class PDSeparatedScheduler(Scheduler):
         )
         self._validate_mtp_draft_tail_channel(so)
         return so
+
+    @staticmethod
+    def _scheduler_output_intersects_req_ids(
+        scheduler_output: SchedulerOutput,
+        req_ids: set[str],
+    ) -> bool:
+        if not req_ids:
+            return False
+        parent_req_id = getattr(scheduler_output, "parent_req_id", None)
+        if parent_req_id in req_ids:
+            return True
+        return any(
+            req_id in req_ids
+            for req_id in scheduler_output.num_scheduled_tokens
+        )
+
+    def _drop_stale_mtp_drafts_for_req_ids(self, req_ids: set[str]) -> None:
+        if not req_ids:
+            return
+        before_first = len(self.mtp_drafts_first_ready)
+        self.mtp_drafts_first_ready = deque(
+            so for so in self.mtp_drafts_first_ready
+            if not self._scheduler_output_intersects_req_ids(so, req_ids)
+        )
+
+        kept_last = deque()
+        dropped_last = 0
+        for so in self.mtp_drafts_last_ready:
+            if self._scheduler_output_intersects_req_ids(so, req_ids):
+                dropped_last += 1
+                continue
+            kept_last.append(so)
+        self.mtp_drafts_last_ready = kept_last
+        if dropped_last and self.mtp_draft_remote_pending_count > 0:
+            self.mtp_draft_remote_pending_count = max(
+                0, self.mtp_draft_remote_pending_count - dropped_last
+            )
+
+        dropped_first = before_first - len(self.mtp_drafts_first_ready)
+        if dropped_first or dropped_last:
+            logger.info(
+                "[PD] dropped stale MTP draft tasks for req_ids=%s, "
+                "first=%d, last=%d, mtp_draft_remote_pending=%d",
+                sorted(req_ids),
+                dropped_first,
+                dropped_last,
+                self.mtp_draft_remote_pending_count,
+            )
 
     def _ensure_cached_all_token_ids(
         self, scheduler_output: SchedulerOutput,
@@ -752,6 +807,13 @@ class PDSeparatedScheduler(Scheduler):
                 f"[PD] update_from_output MTP_DRAFT_FIRST done, "
                 f"mtp_draft_inflight: {self.mtp_draft_inflight_count}/{self.mtp_draft_inflight_limit}",
             )
+        if scheduler_output.batch_type == BatchType.MTP_DRAFT_LAST:
+            if self.mtp_draft_remote_pending_count > 0:
+                self.mtp_draft_remote_pending_count -= 1
+            logger.info(
+                f"[PD] update_from_output MTP_DRAFT_LAST done, "
+                f"mtp_draft_remote_pending: {self.mtp_draft_remote_pending_count}",
+            )
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
             # decode_inflight_count 已在 DECODE_FIRST 的 update_from_output
             # 中释放，此处不再重复减 1。
@@ -790,23 +852,13 @@ class PDSeparatedScheduler(Scheduler):
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[tuple[str, int]]:
         result = super().finish_requests(request_ids, finished_status)
-        if isinstance(request_ids, str):
-            request_ids = (request_ids,)
-        elif request_ids is not None:
-            request_ids = set(request_ids)
-        else:
-            request_ids = self.requests.keys()
-
-        to_remove = set()
-        for req_id in request_ids:
-            req = self.requests.get(req_id)
-            if req and req.is_finished():
-                to_remove.add(req)
-
-        if to_remove:
-            self.chunk_prefill_first = remove_all(
-                self.chunk_prefill_first, to_remove
-            )
+        finished_req_ids = {req_id for req_id, _client_index in result}
+        if finished_req_ids:
+            self._drop_stale_mtp_drafts_for_req_ids(finished_req_ids)
+            self.chunk_prefill_first = [
+                req for req in self.chunk_prefill_first
+                if req.request_id not in finished_req_ids
+            ]
 
         return result
 

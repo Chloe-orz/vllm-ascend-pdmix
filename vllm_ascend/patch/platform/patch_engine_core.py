@@ -195,11 +195,14 @@ def _drain_pd_channel_inbox(self) -> None:
 def _maybe_publish_pre_out(
     self, scheduler_output: SchedulerOutput
 ) -> None:
-    """Forward DECODE_FIRST batches on the edge → cloud channel immediately.
+    """Forward immediate edge → cloud head batches on the PRE_OUT channel.
 
     DECODE_FIRST is published synchronously at schedule time because its
     cloud-side decode-middle segment must start as soon as possible to keep
     the decode pipeline full.
+
+    MTP_DRAFT_FIRST follows the same immediate path when batch_queue is not in
+    use.  In batch_queue mode it is published by _publish_pre_out_when_ready.
 
     PREFILL_FIRST is handled by _publish_pre_out_when_ready instead, which
     delays the ZMQ notification until the prefill head segment becomes the
@@ -209,7 +212,7 @@ def _maybe_publish_pre_out(
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt == BatchType.DECODE_FIRST:
+    if bt in (BatchType.DECODE_FIRST, BatchType.MTP_DRAFT_FIRST):
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
