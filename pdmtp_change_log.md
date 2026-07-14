@@ -26,3 +26,9 @@
 | 22 | M2 | 请求结束时清理 stale MTP draft 首/尾队列，丢弃已回包未执行的 MTP尾时同步释放远端等待计数 | `vllm_ascend/core/pd_separated_scheduler.py` | 无 |
 | 23 | M2 | 请求结束/abort 后通过 Executor RPC 清理 Worker 侧 pending MTP draft context，避免已结束请求重新入队 draft | `vllm/v1/executor/abstract.py`; `vllm/v1/executor/uniproc_executor.py`; `vllm/v1/executor/multiproc_executor.py`; `vllm_ascend/patch/platform/patch_engine_core.py`; `vllm_ascend/worker/worker.py`; `vllm_ascend/worker/model_runner_v1.py` | 无 |
 | 24 | M2 | MTP draft 数据面 payload 增加 `head_token`、`mtp_draft_task_id`、`draft_step_idx` 身份字段，并在云侧/边侧尾段校验 task 与 step 顺序 | `vllm_ascend/worker/worker.py`; `vllm_ascend/worker/model_runner_v1.py` | 无 |
+| 25 | M2 | MTP 初始化时校验 `num_spec_tokens` 和 `num_mtp_layers` 均为正，并打印二者关系；不要求二者相等 | `vllm_ascend/worker/model_runner_v1.py` | 无 |
+| 26 | M2 | 统一普通 step 与 batch_queue 路径的 MTP/P/D 首段 `head_token` 分配，并校验 MTP_DRAFT_LAST 控制面身份字段 | `vllm_ascend/patch/platform/patch_engine_core.py`; `vllm_ascend/v1/engine/passive_core.py`; `vllm_ascend/core/pd_separated_scheduler.py` | 无 |
+| 27 | M2 | 将 MTP draft 首/尾队列和远端等待状态纳入 `has_requests()`，避免严格 MTP 派生任务被 EngineCore 误判为空闲 | `vllm_ascend/core/pd_separated_scheduler.py` | 无 |
+| 28 | M2 | 对齐主仓 Executor 与 Ascend Worker/ModelRunner 的 MTP draft 清理 RPC 参数类型，允许 `set[str]` 直接透传 | `vllm_ascend/worker/worker.py`; `vllm_ascend/worker/model_runner_v1.py` | 无 |
+| 29 | M2 | 在 Qwen-MTP 边云拆分模式下跳过 batch_queue deferred 分支的旧同步 `take_draft_token_ids()` 回填，只使用 MTP_DRAFT 完成结果回填 | `vllm_ascend/patch/platform/patch_engine_core.py` | 无 |
+| 30 | M2 | 已结束请求的远端 `MTP_DRAFT_LAST` 回包在调度器侧识别为 stale 并丢弃，避免进入 ModelRunner 后找不到 pending draft context | `vllm_ascend/core/pd_separated_scheduler.py` | 无 |

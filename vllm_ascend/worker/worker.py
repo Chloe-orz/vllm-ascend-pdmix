@@ -1265,7 +1265,9 @@ class NPUWorker(WorkerBase):
     ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
         return self.model_runner.take_completed_mtp_draft_result()
 
-    def clear_pending_mtp_draft_for_req_ids(self, req_ids: list[str]) -> None:
+    def clear_pending_mtp_draft_for_req_ids(
+        self, req_ids: set[str] | list[str]
+    ) -> None:
         self.model_runner.clear_pending_mtp_draft_for_req_ids(req_ids)
 
     def check_health(self) -> None:

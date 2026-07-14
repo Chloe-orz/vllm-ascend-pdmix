@@ -639,6 +639,14 @@ class PassiveEngineCoreProc:
             tail = replace(
                 scheduler_output, batch_type=BatchType.MTP_DRAFT_LAST
             )
+            if not getattr(tail, "head_token", None):
+                raise RuntimeError("MTP_DRAFT_LAST POST_OUT missing head_token")
+            if not getattr(tail, "mtp_draft_task_id", None):
+                raise RuntimeError(
+                    "MTP_DRAFT_LAST POST_OUT missing mtp_draft_task_id"
+                )
+            if getattr(tail, "draft_step_idx", None) is None:
+                raise RuntimeError("MTP_DRAFT_LAST POST_OUT missing draft_step_idx")
         else:
             return
         # Echo the head_token back so the edge can correlate the tail

@@ -534,6 +534,12 @@ class PDSeparatedScheduler(Scheduler):
     def _validate_mtp_draft_tail_channel(
         self, scheduler_output: SchedulerOutput
     ) -> None:
+        if not getattr(scheduler_output, "head_token", None):
+            raise RuntimeError("MTP_DRAFT_LAST missing head_token")
+        if not getattr(scheduler_output, "mtp_draft_task_id", None):
+            raise RuntimeError("MTP_DRAFT_LAST missing mtp_draft_task_id")
+        if getattr(scheduler_output, "draft_step_idx", None) is None:
+            raise RuntimeError("MTP_DRAFT_LAST missing draft_step_idx")
         if scheduler_output.hidden_channel != HiddenChannelType.DECODE:
             raise RuntimeError(
                 "MTP_DRAFT_LAST expects decode hidden channel, got "
@@ -564,14 +570,27 @@ class PDSeparatedScheduler(Scheduler):
         return so
 
     def _pick_mtp_draft_last_batch(self) -> SchedulerOutput:
-        if not self.mtp_drafts_last_ready:
-            return self._make_empty_batch()
-        so = self.mtp_drafts_last_ready.popleft()
-        assert so.batch_type == BatchType.MTP_DRAFT_LAST, (
-            f"mtp_drafts_last_ready expects MTP_DRAFT_LAST, got {so.batch_type}"
-        )
-        self._validate_mtp_draft_tail_channel(so)
-        return so
+        while self.mtp_drafts_last_ready:
+            so = self.mtp_drafts_last_ready.popleft()
+            assert so.batch_type == BatchType.MTP_DRAFT_LAST, (
+                f"mtp_drafts_last_ready expects MTP_DRAFT_LAST, got {so.batch_type}"
+            )
+            self._validate_mtp_draft_tail_channel(so)
+            if self._is_stale_mtp_draft_output(so):
+                if self.mtp_draft_remote_pending_count > 0:
+                    self.mtp_draft_remote_pending_count -= 1
+                logger.info(
+                    "[PD] drop stale MTP_DRAFT_LAST for inactive request, "
+                    "task_id=%s, parent_req_id=%s, step=%s, "
+                    "mtp_draft_remote_pending=%d",
+                    getattr(so, "mtp_draft_task_id", None),
+                    getattr(so, "parent_req_id", None),
+                    getattr(so, "draft_step_idx", None),
+                    self.mtp_draft_remote_pending_count,
+                )
+                continue
+            return so
+        return self._make_empty_batch()
 
     @staticmethod
     def _scheduler_output_intersects_req_ids(
@@ -620,6 +639,13 @@ class PDSeparatedScheduler(Scheduler):
                 dropped_last,
                 self.mtp_draft_remote_pending_count,
             )
+
+    def _is_stale_mtp_draft_output(self, scheduler_output: SchedulerOutput) -> bool:
+        req_ids = set(scheduler_output.num_scheduled_tokens.keys())
+        parent_req_id = getattr(scheduler_output, "parent_req_id", None)
+        if parent_req_id:
+            req_ids.add(parent_req_id)
+        return bool(req_ids) and all(req_id not in self.requests for req_id in req_ids)
 
     def _ensure_cached_all_token_ids(
         self, scheduler_output: SchedulerOutput,
@@ -847,6 +873,17 @@ class PDSeparatedScheduler(Scheduler):
             + len(self.chunk_prefill_first)
             + len(self.prefill_last_pending)
         )
+
+    def _has_mtp_draft_work(self) -> bool:
+        return bool(
+            self.mtp_drafts_first_ready
+            or self.mtp_drafts_last_ready
+            or self.mtp_draft_inflight_count > 0
+            or self.mtp_draft_remote_pending_count > 0
+        )
+
+    def has_requests(self) -> bool:
+        return super().has_requests() or self._has_mtp_draft_work()
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

@@ -1133,6 +1133,22 @@ class NPUModelRunner(GPUModelRunner):
         from vllm.distributed.parallel_state import get_edge_cloud_layer_range
 
         num_mtp_layers = len(predictor.layers)
+        num_spec_tokens = int(self.num_spec_tokens or 0)
+        if num_mtp_layers <= 0:
+            raise RuntimeError(
+                "Qwen-MTP drafter must have at least one MTP layer"
+            )
+        if num_spec_tokens <= 0:
+            raise RuntimeError(
+                "Qwen-MTP drafter is enabled but num_spec_tokens is not positive"
+            )
+        logger.info(
+            "[EdgeCloud] Qwen-MTP config: num_spec_tokens=%d, "
+            "num_mtp_layers=%d. draft_step_idx selects layer by "
+            "draft_step_idx %% num_mtp_layers.",
+            num_spec_tokens,
+            num_mtp_layers,
+        )
         mtp_module_ids = {id(module) for _, module in mtp_model.named_modules()}
         head_k, tail_k = get_edge_cloud_layer_range()
 
@@ -2617,7 +2633,9 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_mtp_draft_context = None
         return DraftTokenIds(req_ids, draft_token_ids), parent_scheduler_output
 
-    def clear_pending_mtp_draft_for_req_ids(self, req_ids: list[str]) -> None:
+    def clear_pending_mtp_draft_for_req_ids(
+        self, req_ids: set[str] | list[str]
+    ) -> None:
         context = self._pending_mtp_draft_context
         if context is None or not req_ids:
             return

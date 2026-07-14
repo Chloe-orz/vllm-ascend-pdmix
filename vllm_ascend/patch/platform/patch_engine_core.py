@@ -228,6 +228,19 @@ def _maybe_publish_pre_out(
         )
 
 
+def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
+    if getattr(self, "_pp_pd_channel", None) is None:
+        return
+    if scheduler_output.batch_type not in (
+        BatchType.PREFILL_FIRST,
+        BatchType.DECODE_FIRST,
+        BatchType.MTP_DRAFT_FIRST,
+    ):
+        return
+    if not getattr(scheduler_output, "head_token", None):
+        scheduler_output.head_token = uuid4().hex
+
+
 def _publish_pre_out_when_ready(self) -> None:
     """Publish the oldest PREFILL_FIRST batch in batch_queue only when it
     becomes the next batch to execute (rightmost in the deque).
@@ -438,6 +451,15 @@ def _clear_pending_mtp_draft_for_finished_requests(self) -> None:
     clear_pending(finished_req_ids)
 
 
+def _uses_split_qwen_mtp_draft(self) -> bool:
+    speculative_config = getattr(self.vllm_config, "speculative_config", None)
+    return bool(
+        getattr(self, "_pp_pd_channel", None) is not None
+        and speculative_config is not None
+        and getattr(speculative_config, "method", None) == "mtp"
+    )
+
+
 # =======================================================================#
 # EngineCore.step — full replacement, mirrors upstream + dest inserts.    #
 # =======================================================================#
@@ -457,6 +479,7 @@ def _patched_step(self):
     self._drain_pd_channel_inbox()
 
     scheduler_output = self.scheduler.schedule()
+    self._ensure_pd_head_token(scheduler_output)
 
     # [ascend insert] Forward head-segment batches on the PRE_OUT
     # (edge → cloud) channel.
@@ -516,18 +539,8 @@ def _patched_step_with_batch_queue(self):
         scheduler_output = self.scheduler.schedule()
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
-        # batches so the tail-segment can be matched to the suspended
-        # state.
-        if (
-            getattr(self, "_pp_pd_channel", None) is not None
-            and scheduler_output.batch_type in (
-                BatchType.PREFILL_FIRST,
-                BatchType.DECODE_FIRST,
-                BatchType.MTP_DRAFT_FIRST,
-            )
-            and not getattr(scheduler_output, "head_token", None)
-        ):
-            scheduler_output.head_token = uuid4().hex
+        # batches so the tail-segment can be matched to the suspended state.
+        self._ensure_pd_head_token(scheduler_output)
 
         # [ascend insert] DECODE_FIRST is published immediately to keep the
         # decode pipeline full; PREFILL_FIRST is delayed via
@@ -639,7 +652,7 @@ def _patched_step_with_batch_queue(self):
                 engine_core_outputs = empty_outputs
 
     if deferred_scheduler_output:
-        if self.use_spec_decode:
+        if self.use_spec_decode and not self._uses_split_qwen_mtp_draft():
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids_in_output(
@@ -767,6 +780,7 @@ def install() -> None:
     EngineCore.__init__ = _patched_engine_core_init
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
+    EngineCore._ensure_pd_head_token = _ensure_pd_head_token
     EngineCore._publish_pre_out_when_ready = _publish_pre_out_when_ready
     EngineCore._clear_published_pre_out_token = _clear_published_pre_out_token
     EngineCore._needs_sample_tokens = _needs_sample_tokens
@@ -781,6 +795,7 @@ def install() -> None:
     EngineCore._clear_pending_mtp_draft_for_finished_requests = (
         _clear_pending_mtp_draft_for_finished_requests
     )
+    EngineCore._uses_split_qwen_mtp_draft = _uses_split_qwen_mtp_draft
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
     EngineCore.shutdown = _patched_engine_core_shutdown
