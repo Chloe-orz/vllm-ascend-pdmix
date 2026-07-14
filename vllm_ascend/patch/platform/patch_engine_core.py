@@ -343,6 +343,7 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
     """Complete an EMPTY SchedulerOutput without broadcasting to workers."""
     self._stash_empty_worker_cleanup(scheduler_output)
     self._process_aborts_queue()
+    self._clear_pending_mtp_draft_for_finished_requests()
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
@@ -350,6 +351,7 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT
         )
+    self._clear_pending_mtp_draft_for_finished_requests()
     return engine_core_outputs, False
 
 
@@ -420,6 +422,22 @@ def _enqueue_pending_mtp_draft_if_ready(self) -> None:
     )
 
 
+def _clear_pending_mtp_draft_for_finished_requests(self) -> None:
+    if not getattr(self, "use_spec_decode", False):
+        return
+    finished_req_ids = set(getattr(self.scheduler, "finished_req_ids", set()) or ())
+    if not finished_req_ids:
+        return
+    clear_pending = getattr(
+        self.model_executor,
+        "clear_pending_mtp_draft_for_req_ids",
+        None,
+    )
+    if clear_pending is None:
+        return
+    clear_pending(finished_req_ids)
+
+
 # =======================================================================#
 # EngineCore.step — full replacement, mirrors upstream + dest inserts.    #
 # =======================================================================#
@@ -464,9 +482,11 @@ def _patched_step(self):
     # Before processing the model output, process any aborts that happened
     # during the model execution.
     self._process_aborts_queue()
+    self._clear_pending_mtp_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
+    self._clear_pending_mtp_draft_for_finished_requests()
     self._enqueue_pending_mtp_draft_if_ready()
 
     return (
@@ -595,9 +615,11 @@ def _patched_step_with_batch_queue(self):
             raise RuntimeError("unexpected error")
 
     self._process_aborts_queue()
+    self._clear_pending_mtp_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
+    self._clear_pending_mtp_draft_for_finished_requests()
     self._enqueue_pending_mtp_draft_if_ready()
 
     if deferred_empty_batch := self._pop_deferred_empty_batch():
@@ -755,6 +777,9 @@ def install() -> None:
     EngineCore._pop_deferred_empty_batch = _pop_deferred_empty_batch
     EngineCore._enqueue_pending_mtp_draft_if_ready = (
         _enqueue_pending_mtp_draft_if_ready
+    )
+    EngineCore._clear_pending_mtp_draft_for_finished_requests = (
+        _clear_pending_mtp_draft_for_finished_requests
     )
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue

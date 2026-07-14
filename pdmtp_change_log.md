@@ -24,3 +24,5 @@
 | 20 | M2 | 增加 MTP draft 远端等待计数，阻止 `MTP_DRAFT_FIRST` 已发送但 `MTP_DRAFT_LAST` 未完成时提前调度 VERIFY | `vllm_ascend/core/pd_separated_scheduler.py` | strict MTP：`MTP首 -> 等 MTP尾 -> 下一步 MTP首或 VERIFY首` |
 | 21 | M2 | 非 batch_queue 路径下允许 `MTP_DRAFT_FIRST` 直接发布 PRE_OUT 控制面，避免云侧收不到 DRAFT中任务 | `vllm_ascend/patch/platform/patch_engine_core.py` | 无 |
 | 22 | M2 | 请求结束时清理 stale MTP draft 首/尾队列，丢弃已回包未执行的 MTP尾时同步释放远端等待计数 | `vllm_ascend/core/pd_separated_scheduler.py` | 无 |
+| 23 | M2 | 请求结束/abort 后通过 Executor RPC 清理 Worker 侧 pending MTP draft context，避免已结束请求重新入队 draft | `vllm/v1/executor/abstract.py`; `vllm/v1/executor/uniproc_executor.py`; `vllm/v1/executor/multiproc_executor.py`; `vllm_ascend/patch/platform/patch_engine_core.py`; `vllm_ascend/worker/worker.py`; `vllm_ascend/worker/model_runner_v1.py` | 无 |
+| 24 | M2 | MTP draft 数据面 payload 增加 `head_token`、`mtp_draft_task_id`、`draft_step_idx` 身份字段，并在云侧/边侧尾段校验 task 与 step 顺序 | `vllm_ascend/worker/worker.py`; `vllm_ascend/worker/model_runner_v1.py` | 无 |

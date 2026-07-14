@@ -816,7 +816,7 @@ class NPUWorker(WorkerBase):
             getattr(scheduler_output, "mtp_draft_task_id", None),
             getattr(scheduler_output, "draft_step_idx", None),
         )
-        self.model_runner._run_mtp_cloud_segment()
+        self.model_runner._run_mtp_cloud_segment(scheduler_output)
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
         return ModelRunnerOutput(
             req_ids=req_ids,
@@ -838,12 +838,18 @@ class NPUWorker(WorkerBase):
         )
         assert isinstance(output, IntermediateTensors)
         if get_pp_group().world_size == 2:
-            send_work = edge_cloud_send_tensor_dict_mtp(
-                {
-                    k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                    for k, v in output.items()
-                }
+            tensor_dict = {
+                k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                for k, v in output.items()
+            }
+            tensor_dict["head_token"] = scheduler_output.head_token
+            tensor_dict["mtp_draft_task_id"] = getattr(
+                scheduler_output, "mtp_draft_task_id", None
             )
+            tensor_dict["draft_step_idx"] = int(
+                getattr(scheduler_output, "draft_step_idx", 0) or 0
+            )
+            send_work = edge_cloud_send_tensor_dict_mtp(tensor_dict)
             self._record_pp_send_work(
                 send_work,
                 channel=self._hidden_channel_for(scheduler_output),
@@ -871,6 +877,9 @@ class NPUWorker(WorkerBase):
             handle.wait()
         for postprocess in comm_postprocess:
             postprocess()
+        self.model_runner._validate_mtp_payload_identity(
+            scheduler_output, tensor_dict
+        )
         intermediate_tensors = IntermediateTensors(tensor_dict)
         return self.model_runner._run_mtp_edge_last_segment(
             scheduler_output,
@@ -1255,6 +1264,9 @@ class NPUWorker(WorkerBase):
         self,
     ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
         return self.model_runner.take_completed_mtp_draft_result()
+
+    def clear_pending_mtp_draft_for_req_ids(self, req_ids: list[str]) -> None:
+        self.model_runner.clear_pending_mtp_draft_for_req_ids(req_ids)
 
     def check_health(self) -> None:
         import subprocess

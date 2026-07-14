@@ -1352,7 +1352,10 @@ class NPUModelRunner(GPUModelRunner):
 
         return per_layer_attn_metadata
 
-    def _run_mtp_cloud_segment(self) -> None:
+    def _run_mtp_cloud_segment(
+        self,
+        scheduler_output: "SchedulerOutput | None" = None,
+    ) -> None:
         from vllm_ascend.distributed.parallel_state import (
             edge_cloud_broadcast_recv_mtp,
             edge_cloud_send_tensor_dict_mtp,
@@ -1365,10 +1368,14 @@ class NPUModelRunner(GPUModelRunner):
             handle.wait()
         for postprocess in comm_postprocess:
             postprocess()
+        if scheduler_output is not None:
+            self._validate_mtp_payload_identity(scheduler_output, tensor_dict)
 
         intermediate = IntermediateTensors(tensor_dict)
         positions = intermediate.tensors.get("positions", None)
-        num_tokens = positions.shape[-1] if positions is not None else 0
+        if positions is None:
+            raise RuntimeError("MTP_DRAFT cloud payload missing positions")
+        num_tokens = positions.shape[-1]
         intermediate = self._sync_edge_cloud_mtp_intermediate_tensors(
             num_tokens, intermediate
         )
@@ -1402,12 +1409,19 @@ class NPUModelRunner(GPUModelRunner):
         assert isinstance(output, IntermediateTensors)
 
         if get_pp_group().world_size == 2:
-            send_work = edge_cloud_send_tensor_dict_mtp(
-                {
-                    k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                    for k, v in output.items()
-                }
-            )
+            out_tensor_dict = {
+                k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                for k, v in output.items()
+            }
+            if scheduler_output is not None:
+                out_tensor_dict["head_token"] = scheduler_output.head_token
+                out_tensor_dict["mtp_draft_task_id"] = getattr(
+                    scheduler_output, "mtp_draft_task_id", None
+                )
+                out_tensor_dict["draft_step_idx"] = int(
+                    getattr(scheduler_output, "draft_step_idx", 0) or 0
+                )
+            send_work = edge_cloud_send_tensor_dict_mtp(out_tensor_dict)
             for handle in send_work:
                 handle.wait()
 
@@ -2603,6 +2617,23 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_mtp_draft_context = None
         return DraftTokenIds(req_ids, draft_token_ids), parent_scheduler_output
 
+    def clear_pending_mtp_draft_for_req_ids(self, req_ids: list[str]) -> None:
+        context = self._pending_mtp_draft_context
+        if context is None or not req_ids:
+            return
+        pending_req_ids = set(context.get("req_ids") or ())
+        stale_req_ids = pending_req_ids.intersection(req_ids)
+        if not stale_req_ids:
+            return
+        logger.info(
+            "Clear pending Qwen-MTP draft context for finished req_ids=%s, "
+            "task_id=%s, step=%s",
+            sorted(stale_req_ids),
+            context.get("mtp_draft_task_id"),
+            context.get("draft_step_idx"),
+        )
+        self._pending_mtp_draft_context = None
+
     def _get_pending_mtp_draft_context(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2722,6 +2753,45 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits[: hidden_states.shape[0]]
         return logits.argmax(dim=-1)
 
+    @staticmethod
+    def _validate_mtp_payload_identity(
+        scheduler_output: "SchedulerOutput",
+        tensor_dict: dict[str, Any],
+    ) -> None:
+        expected_task_id = getattr(scheduler_output, "mtp_draft_task_id", None)
+        actual_task_id = tensor_dict.get("mtp_draft_task_id")
+        if expected_task_id is not None and actual_task_id != expected_task_id:
+            raise RuntimeError(
+                "MTP_DRAFT payload task mismatch: "
+                f"expected={expected_task_id}, got={actual_task_id}"
+            )
+
+        expected_step = int(getattr(scheduler_output, "draft_step_idx", 0) or 0)
+        actual_step = tensor_dict.get("draft_step_idx")
+        if torch.is_tensor(actual_step):
+            actual_step = int(actual_step.item())
+        if actual_step is not None and int(actual_step) != expected_step:
+            raise RuntimeError(
+                "MTP_DRAFT payload step mismatch: "
+                f"expected={expected_step}, got={actual_step}"
+            )
+        actual_spec_step = tensor_dict.get("spec_step_idx")
+        if torch.is_tensor(actual_spec_step):
+            actual_spec_step = int(actual_spec_step.item())
+        if actual_spec_step is not None and int(actual_spec_step) != expected_step:
+            raise RuntimeError(
+                "MTP_DRAFT payload spec_step_idx mismatch: "
+                f"expected={expected_step}, got={actual_spec_step}"
+            )
+
+        expected_head_token = getattr(scheduler_output, "head_token", None)
+        actual_head_token = tensor_dict.get("head_token")
+        if expected_head_token is not None and actual_head_token != expected_head_token:
+            raise RuntimeError(
+                "MTP_DRAFT payload head_token mismatch: "
+                f"expected={expected_head_token}, got={actual_head_token}"
+            )
+
     def _run_mtp_edge_last_segment(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2755,6 +2825,11 @@ class NPUModelRunner(GPUModelRunner):
         context["last_draft_positions"] = positions
         context["last_draft_token_ids"] = draft_token_ids
         draft_steps = context.setdefault("draft_token_id_steps", [])
+        if len(draft_steps) != draft_step_idx:
+            raise RuntimeError(
+                "MTP_DRAFT step order mismatch: "
+                f"expected step {len(draft_steps)}, got {draft_step_idx}"
+            )
         draft_steps.append(draft_token_ids)
         next_step_idx = draft_step_idx + 1
         if next_step_idx < self.num_spec_tokens:
