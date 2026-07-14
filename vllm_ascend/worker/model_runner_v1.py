@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -64,7 +65,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.core.sched.output import BatchType, SchedulerOutput
+from vllm.v1.core.sched.output import BatchType, HiddenChannelType, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -77,6 +78,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
+    DraftTokenIds,
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
@@ -2532,6 +2534,239 @@ class NPUModelRunner(GPUModelRunner):
             "Deferred Qwen-MTP draft after %s, req_ids=%s",
             scheduler_output.batch_type,
             self._pending_mtp_draft_context["req_ids"],
+        )
+
+    def take_pending_mtp_draft_scheduler_output(
+        self,
+    ) -> "SchedulerOutput | None":
+        context = self._pending_mtp_draft_context
+        if (
+            context is None
+            or context.get("enqueued", False)
+            or context.get("draft_complete", False)
+        ):
+            return None
+
+        req_ids = tuple(context.get("req_ids") or ())
+        if not req_ids:
+            logger.warning("Skip pending Qwen-MTP draft without request ids")
+            return None
+
+        task_id = context.get("mtp_draft_task_id") or uuid4().hex
+        draft_step_idx = int(context.get("draft_step_idx", 0) or 0)
+        context["mtp_draft_task_id"] = task_id
+        context["draft_step_idx"] = draft_step_idx
+        context["enqueued"] = True
+
+        scheduler_output = replace(
+            context["scheduler_output"],
+            batch_type=BatchType.MTP_DRAFT_FIRST,
+            head_token=None,
+            hidden_channel=HiddenChannelType.MTP_DRAFT,
+            parent_req_id=req_ids[0],
+            mtp_draft_task_id=task_id,
+            draft_step_idx=draft_step_idx,
+        )
+        logger.debug(
+            "Prepared Qwen-MTP draft scheduler output, task_id=%s, "
+            "parent_req_id=%s, step=%s, req_ids=%s",
+            task_id,
+            req_ids[0],
+            draft_step_idx,
+            req_ids,
+        )
+        return scheduler_output
+
+    def take_completed_mtp_draft_result(
+        self,
+    ) -> "tuple[DraftTokenIds, SchedulerOutput] | None":
+        context = self._pending_mtp_draft_context
+        if (
+            context is None
+            or not context.get("draft_complete", False)
+            or context.get("result_taken", False)
+        ):
+            return None
+
+        draft_steps = context.get("draft_token_id_steps") or []
+        if len(draft_steps) < self.num_spec_tokens:
+            return None
+
+        draft_token_tensor = torch.stack(
+            draft_steps[: self.num_spec_tokens], dim=1
+        )
+        draft_token_ids = draft_token_tensor.detach().cpu().tolist()
+        req_ids = list(context["req_ids"])
+        parent_scheduler_output = context["scheduler_output"]
+
+        context["result_taken"] = True
+        self._pending_mtp_draft_context = None
+        return DraftTokenIds(req_ids, draft_token_ids), parent_scheduler_output
+
+    def _get_pending_mtp_draft_context(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, Any]:
+        context = self._pending_mtp_draft_context
+        if context is None:
+            raise RuntimeError("MTP_DRAFT batch has no pending draft context")
+        task_id = getattr(scheduler_output, "mtp_draft_task_id", None)
+        if task_id is not None and context.get("mtp_draft_task_id") != task_id:
+            raise RuntimeError(
+                "MTP_DRAFT task mismatch: "
+                f"expected={context.get('mtp_draft_task_id')}, got={task_id}"
+            )
+        return context
+
+    def _select_pending_mtp_rows(
+        self,
+        tensor: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        if tensor.shape[0] == num_reqs:
+            return tensor
+        return tensor[-num_reqs:]
+
+    def _prepare_mtp_edge_step_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        context = self._get_pending_mtp_draft_context(scheduler_output)
+        draft_step_idx = int(getattr(scheduler_output, "draft_step_idx", 0) or 0)
+
+        if draft_step_idx > 0:
+            input_ids = context["last_draft_token_ids"]
+            positions = context["last_draft_positions"] + 1
+            hidden_states = context["last_draft_hidden_states"]
+            return input_ids, positions, hidden_states, draft_step_idx
+
+        sampled_token_ids = context["sampled_token_ids"]
+        num_reqs = len(context["req_ids"])
+        if torch.is_tensor(sampled_token_ids):
+            assert self.drafter is not None
+            input_ids, _ = self.drafter.prepare_next_token_ids_padded(
+                sampled_token_ids,
+                self.requests,
+                self.input_batch,
+                self.discard_request_indices.gpu,
+                self.num_discarded_requests,
+            )
+        else:
+            input_ids_list: list[int] = []
+            for req_idx, req_id in enumerate(context["req_ids"]):
+                sampled_tokens = sampled_token_ids[req_idx]
+                if sampled_tokens:
+                    input_ids_list.append(sampled_tokens[-1])
+                else:
+                    input_ids_list.append(
+                        self.requests[req_id].get_token_id(
+                            int(self.input_batch.num_tokens_no_spec[req_idx])
+                            - 1
+                        )
+                    )
+            input_ids = torch.tensor(
+                input_ids_list, dtype=torch.long, device=self.device
+            )
+
+        positions = context["positions"]
+        if self.uses_mrope:
+            positions = positions[:, -num_reqs:]
+        else:
+            positions = self._select_pending_mtp_rows(positions, num_reqs)
+
+        hidden_states = context.get("sample_hidden_states")
+        if hidden_states is None:
+            hidden_states = context["hidden_states"]
+        hidden_states = self._select_pending_mtp_rows(hidden_states, num_reqs)
+
+        return input_ids, positions, hidden_states, draft_step_idx
+
+    def _run_mtp_edge_first_segment(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> IntermediateTensors:
+        context = self._get_pending_mtp_draft_context(scheduler_output)
+        input_ids, positions, hidden_states, draft_step_idx = (
+            self._prepare_mtp_edge_step_inputs(scheduler_output)
+        )
+        segment = self._edge_cloud_mtp_segments["a"]
+        output = segment(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+            spec_step_idx=draft_step_idx,
+        )
+        assert isinstance(output, IntermediateTensors)
+        output["positions"] = positions
+        output["spec_step_idx"] = torch.tensor(
+            draft_step_idx, dtype=torch.int64, device="cpu"
+        )
+        context["current_mtp_positions"] = positions
+        context["current_mtp_step_idx"] = draft_step_idx
+        return output
+
+    def _compute_mtp_draft_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        draft_step_idx: int,
+    ) -> torch.Tensor:
+        mtp_model = self.drafter.model
+        if hasattr(mtp_model, "compute_logits"):
+            try:
+                logits = mtp_model.compute_logits(hidden_states, draft_step_idx)
+            except TypeError:
+                logits = mtp_model.compute_logits(hidden_states)
+        else:
+            logits = mtp_model.logits_processor(mtp_model.lm_head, hidden_states)
+        if lmhead_tp_enable():
+            logits = logits[: hidden_states.shape[0]]
+        return logits.argmax(dim=-1)
+
+    def _run_mtp_edge_last_segment(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors,
+    ) -> ModelRunnerOutput:
+        context = self._get_pending_mtp_draft_context(scheduler_output)
+        draft_step_idx = int(getattr(scheduler_output, "draft_step_idx", 0) or 0)
+        positions = context.get(
+            "current_mtp_positions",
+            intermediate_tensors.tensors.get("positions"),
+        )
+        if positions is None:
+            raise RuntimeError("MTP_DRAFT_LAST missing positions")
+
+        num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
+        intermediate_tensors = self._sync_edge_cloud_mtp_intermediate_tensors(
+            num_tokens, intermediate_tensors
+        )
+        segment = self._edge_cloud_mtp_segments["e"]
+        hidden_states = segment(
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            spec_step_idx=draft_step_idx,
+        )
+        assert torch.is_tensor(hidden_states)
+
+        draft_token_ids = self._compute_mtp_draft_token_ids(
+            hidden_states, draft_step_idx
+        )
+        context["last_draft_hidden_states"] = hidden_states
+        context["last_draft_positions"] = positions
+        context["last_draft_token_ids"] = draft_token_ids
+        draft_steps = context.setdefault("draft_token_id_steps", [])
+        draft_steps.append(draft_token_ids)
+        next_step_idx = draft_step_idx + 1
+        if next_step_idx < self.num_spec_tokens:
+            context["draft_step_idx"] = next_step_idx
+            context["enqueued"] = False
+        else:
+            context["draft_complete"] = True
+
+        req_ids = list(context["req_ids"])
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
         )
 
     def _copy_draft_token_ids_to_cpu(

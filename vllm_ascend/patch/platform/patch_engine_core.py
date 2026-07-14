@@ -366,6 +366,57 @@ def _pop_deferred_empty_batch(self) -> SchedulerOutput | None:
     return deferred.pop(0)
 
 
+def _enqueue_pending_mtp_draft_if_ready(self) -> None:
+    """Move a pending Qwen-MTP draft task from Worker into scheduler."""
+    if not getattr(self, "use_spec_decode", False):
+        return
+    queue = getattr(self.scheduler, "mtp_drafts_first_ready", None)
+    if queue is None:
+        return
+
+    take_completed = getattr(
+        self.model_executor,
+        "take_completed_mtp_draft_result",
+        None,
+    )
+    if take_completed is not None:
+        completed = take_completed()
+        if completed is not None:
+            draft_token_ids, parent_scheduler_output = completed
+            self.scheduler.update_draft_token_ids_in_output(
+                draft_token_ids,
+                parent_scheduler_output,
+            )
+            logger.debug(
+                "Updated scheduler with completed Qwen-MTP draft tokens, "
+                "req_ids=%s",
+                draft_token_ids.req_ids,
+            )
+
+    take_pending = getattr(
+        self.model_executor,
+        "take_pending_mtp_draft_scheduler_output",
+        None,
+    )
+    if take_pending is None:
+        return
+
+    scheduler_output = take_pending()
+    if scheduler_output is None:
+        return
+    if scheduler_output.batch_type != BatchType.MTP_DRAFT_FIRST:
+        raise RuntimeError(
+            "Pending MTP draft must be MTP_DRAFT_FIRST, got "
+            f"{scheduler_output.batch_type}"
+        )
+    queue.append(scheduler_output)
+    logger.debug(
+        "Queued pending Qwen-MTP draft task, task_id=%s, parent_req_id=%s",
+        getattr(scheduler_output, "mtp_draft_task_id", None),
+        getattr(scheduler_output, "parent_req_id", None),
+    )
+
+
 # =======================================================================#
 # EngineCore.step — full replacement, mirrors upstream + dest inserts.    #
 # =======================================================================#
@@ -413,6 +464,7 @@ def _patched_step(self):
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
+    self._enqueue_pending_mtp_draft_if_ready()
 
     return (
         engine_core_outputs,
@@ -543,6 +595,7 @@ def _patched_step_with_batch_queue(self):
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
+    self._enqueue_pending_mtp_draft_if_ready()
 
     if deferred_empty_batch := self._pop_deferred_empty_batch():
         empty_outputs, _ = self._finish_empty_batch(deferred_empty_batch)
@@ -697,6 +750,9 @@ def install() -> None:
     EngineCore._finish_empty_batch = _finish_empty_batch
     EngineCore._defer_empty_batch = _defer_empty_batch
     EngineCore._pop_deferred_empty_batch = _pop_deferred_empty_batch
+    EngineCore._enqueue_pending_mtp_draft_if_ready = (
+        _enqueue_pending_mtp_draft_if_ready
+    )
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
     EngineCore.shutdown = _patched_engine_core_shutdown

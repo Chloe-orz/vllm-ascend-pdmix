@@ -15,3 +15,8 @@
 | 11 | M2 | 新增云侧单步 Qwen-MTP draft 中段执行方法，接收动态 payload、构造 draft attention metadata 并通过 `MTP_DRAFT` 通道回传 | `vllm_ascend/worker/model_runner_v1.py` | 无 |
 | 12 | M2 | 云侧 POST_OUT 控制面增加 `MTP_DRAFT_FIRST -> MTP_DRAFT_LAST` 映射 | `vllm_ascend/v1/engine/passive_core.py` | 无 |
 | 13 | M2 | Worker 云侧分发 `MTP_DRAFT_FIRST` 到 Qwen-MTP 单步中段执行路径，避免误用普通 P/D hidden meta | `vllm_ascend/worker/worker.py` | 无 |
+| 14 | M2 | 将暂存的 Qwen-MTP pending draft 上下文封装成可由 Worker 取出的 `MTP_DRAFT_FIRST SchedulerOutput` | `vllm_ascend/worker/model_runner_v1.py`; `vllm_ascend/worker/worker.py` | 无 |
+| 15 | M2 | 边侧新增 Qwen-MTP 单步 draft 首段/尾段执行入口：首段发送 MTP payload，尾段接收云侧 hidden 并生成本 step draft token | `vllm_ascend/worker/model_runner_v1.py`; `vllm_ascend/worker/worker.py` | 无 |
+| 16 | M2 | EngineCore 在 verify 输出更新后拉取 pending MTP draft，并入队到边侧 `mtp_drafts_first_ready` | `vllm/v1/executor/abstract.py`; `vllm/v1/executor/uniproc_executor.py`; `vllm/v1/executor/multiproc_executor.py`; `vllm_ascend/patch/platform/patch_engine_core.py` | 无 |
+| 17 | M2 | MTP draft 尾段完成后推进下一 draft step，同一 `mtp_draft_task_id` 递增 `draft_step_idx` 重新入队直到达到 `num_spec_tokens` | `vllm_ascend/worker/model_runner_v1.py` | 无 |
+| 18 | M2 | 最后一个 MTP draft step 完成后组装 `DraftTokenIds` 并通过父 verify `SchedulerOutput` 回填 Scheduler | `vllm/v1/executor/abstract.py`; `vllm/v1/executor/uniproc_executor.py`; `vllm/v1/executor/multiproc_executor.py`; `vllm_ascend/worker/model_runner_v1.py`; `vllm_ascend/worker/worker.py`; `vllm_ascend/patch/platform/patch_engine_core.py` | 无 |
