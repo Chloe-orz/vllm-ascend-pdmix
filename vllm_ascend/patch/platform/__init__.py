@@ -38,6 +38,10 @@ import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
 import vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser  # noqa
 import vllm_ascend.patch.platform.patch_deepseek_v4_thinking  # noqa
 import vllm_ascend.patch.platform.patch_qwen3_5_config  # noqa
+# Qwen3.5-MTP is validated as a draft model while EngineConfig is being
+# created, before worker/model patches are loaded.  Load the model patch here
+# so Qwen3_5MTP exposes PP support before SpeculativeConfig verification.
+import vllm_ascend.patch.models.qwen3_5_edge_cloud  # noqa
 import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
 import vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa
 
