@@ -32,3 +32,4 @@
 | 28 | M2 | 对齐主仓 Executor 与 Ascend Worker/ModelRunner 的 MTP draft 清理 RPC 参数类型，允许 `set[str]` 直接透传 | `vllm_ascend/worker/worker.py`; `vllm_ascend/worker/model_runner_v1.py` | 无 |
 | 29 | M2 | 在 Qwen-MTP 边云拆分模式下跳过 batch_queue deferred 分支的旧同步 `take_draft_token_ids()` 回填，只使用 MTP_DRAFT 完成结果回填 | `vllm_ascend/patch/platform/patch_engine_core.py` | 无 |
 | 30 | M2 | 已结束请求的远端 `MTP_DRAFT_LAST` 回包在调度器侧识别为 stale 并丢弃，避免进入 ModelRunner 后找不到 pending draft context | `vllm_ascend/core/pd_separated_scheduler.py` | 无 |
+| 31 | M2 | 将 Qwen-MTP pending draft 从单槽位改为 `task_id -> context` 字典加 pending task 队列，支持多个 P尾/VERIFY尾 派生 draft 并存 | `vllm_ascend/worker/model_runner_v1.py` | 无 |

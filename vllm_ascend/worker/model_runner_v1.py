@@ -21,7 +21,7 @@ import math
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -489,7 +489,8 @@ class NPUModelRunner(GPUModelRunner):
         # head_token.  Each entry holds the minimal context needed to verify
         # that a later tail-segment batch matches its head segment.
         self._pending_head_states: dict[str, "HeadState"] = {}
-        self._pending_mtp_draft_context: dict[str, Any] | None = None
+        self._pending_mtp_draft_contexts: dict[str, dict[str, Any]] = {}
+        self._pending_mtp_draft_task_ids: deque[str] = deque()
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2544,7 +2545,8 @@ class NPUModelRunner(GPUModelRunner):
         batch_desc: BatchDescriptor | None,
         use_padded_batch: bool,
     ) -> None:
-        self._pending_mtp_draft_context = {
+        task_id = uuid4().hex
+        context = {
             "scheduler_output": scheduler_output,
             "sampled_token_ids": sampled_token_ids,
             "sampling_metadata": self.input_batch.sampling_metadata,
@@ -2558,33 +2560,53 @@ class NPUModelRunner(GPUModelRunner):
             "target_model_batch_desc": batch_desc,
             "use_padded_batch": use_padded_batch,
             "req_ids": tuple(self.input_batch.req_ids),
+            "mtp_draft_task_id": task_id,
+            "draft_step_idx": 0,
         }
+        self._pending_mtp_draft_contexts[task_id] = context
+        self._queue_pending_mtp_draft_task(task_id)
         self._draft_token_ids = None
         logger.debug(
-            "Deferred Qwen-MTP draft after %s, req_ids=%s",
+            "Deferred Qwen-MTP draft after %s, task_id=%s, req_ids=%s",
             scheduler_output.batch_type,
-            self._pending_mtp_draft_context["req_ids"],
+            task_id,
+            context["req_ids"],
         )
+
+    def _queue_pending_mtp_draft_task(self, task_id: str) -> None:
+        if task_id not in self._pending_mtp_draft_task_ids:
+            self._pending_mtp_draft_task_ids.append(task_id)
 
     def take_pending_mtp_draft_scheduler_output(
         self,
     ) -> "SchedulerOutput | None":
-        context = self._pending_mtp_draft_context
-        if (
-            context is None
-            or context.get("enqueued", False)
-            or context.get("draft_complete", False)
-        ):
+        context = None
+        task_id = None
+        while self._pending_mtp_draft_task_ids:
+            candidate_task_id = self._pending_mtp_draft_task_ids.popleft()
+            candidate = self._pending_mtp_draft_contexts.get(candidate_task_id)
+            if (
+                candidate is None
+                or candidate.get("enqueued", False)
+                or candidate.get("draft_complete", False)
+            ):
+                continue
+            context = candidate
+            task_id = candidate_task_id
+            break
+        if context is None or task_id is None:
             return None
 
         req_ids = tuple(context.get("req_ids") or ())
         if not req_ids:
-            logger.warning("Skip pending Qwen-MTP draft without request ids")
+            logger.warning(
+                "Skip pending Qwen-MTP draft without request ids, task_id=%s",
+                task_id,
+            )
+            self._pending_mtp_draft_contexts.pop(task_id, None)
             return None
 
-        task_id = context.get("mtp_draft_task_id") or uuid4().hex
         draft_step_idx = int(context.get("draft_step_idx", 0) or 0)
-        context["mtp_draft_task_id"] = task_id
         context["draft_step_idx"] = draft_step_idx
         context["enqueued"] = True
 
@@ -2610,12 +2632,17 @@ class NPUModelRunner(GPUModelRunner):
     def take_completed_mtp_draft_result(
         self,
     ) -> "tuple[DraftTokenIds, SchedulerOutput] | None":
-        context = self._pending_mtp_draft_context
-        if (
-            context is None
-            or not context.get("draft_complete", False)
-            or context.get("result_taken", False)
-        ):
+        completed_task_id = None
+        context = None
+        for task_id, candidate in self._pending_mtp_draft_contexts.items():
+            if (
+                candidate.get("draft_complete", False)
+                and not candidate.get("result_taken", False)
+            ):
+                completed_task_id = task_id
+                context = candidate
+                break
+        if context is None or completed_task_id is None:
             return None
 
         draft_steps = context.get("draft_token_id_steps") or []
@@ -2630,40 +2657,51 @@ class NPUModelRunner(GPUModelRunner):
         parent_scheduler_output = context["scheduler_output"]
 
         context["result_taken"] = True
-        self._pending_mtp_draft_context = None
+        self._pending_mtp_draft_contexts.pop(completed_task_id, None)
         return DraftTokenIds(req_ids, draft_token_ids), parent_scheduler_output
 
     def clear_pending_mtp_draft_for_req_ids(
         self, req_ids: set[str] | list[str]
     ) -> None:
-        context = self._pending_mtp_draft_context
-        if context is None or not req_ids:
+        if not req_ids:
             return
-        pending_req_ids = set(context.get("req_ids") or ())
-        stale_req_ids = pending_req_ids.intersection(req_ids)
-        if not stale_req_ids:
-            return
-        logger.info(
-            "Clear pending Qwen-MTP draft context for finished req_ids=%s, "
-            "task_id=%s, step=%s",
-            sorted(stale_req_ids),
-            context.get("mtp_draft_task_id"),
-            context.get("draft_step_idx"),
-        )
-        self._pending_mtp_draft_context = None
+        stale_task_ids = []
+        req_id_set = set(req_ids)
+        for task_id, context in self._pending_mtp_draft_contexts.items():
+            pending_req_ids = set(context.get("req_ids") or ())
+            stale_req_ids = pending_req_ids.intersection(req_id_set)
+            if not stale_req_ids:
+                continue
+            logger.info(
+                "Clear pending Qwen-MTP draft context for finished req_ids=%s, "
+                "task_id=%s, step=%s",
+                sorted(stale_req_ids),
+                task_id,
+                context.get("draft_step_idx"),
+            )
+            stale_task_ids.append(task_id)
+        for task_id in stale_task_ids:
+            self._pending_mtp_draft_contexts.pop(task_id, None)
+        if stale_task_ids:
+            stale_task_id_set = set(stale_task_ids)
+            self._pending_mtp_draft_task_ids = deque(
+                task_id
+                for task_id in self._pending_mtp_draft_task_ids
+                if task_id not in stale_task_id_set
+            )
 
     def _get_pending_mtp_draft_context(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> dict[str, Any]:
-        context = self._pending_mtp_draft_context
-        if context is None:
-            raise RuntimeError("MTP_DRAFT batch has no pending draft context")
         task_id = getattr(scheduler_output, "mtp_draft_task_id", None)
-        if task_id is not None and context.get("mtp_draft_task_id") != task_id:
+        if task_id is None:
+            raise RuntimeError("MTP_DRAFT batch missing mtp_draft_task_id")
+        context = self._pending_mtp_draft_contexts.get(task_id)
+        if context is None:
             raise RuntimeError(
-                "MTP_DRAFT task mismatch: "
-                f"expected={context.get('mtp_draft_task_id')}, got={task_id}"
+                "MTP_DRAFT batch has no pending draft context: "
+                f"task_id={task_id}"
             )
         return context
 
@@ -2853,6 +2891,9 @@ class NPUModelRunner(GPUModelRunner):
         if next_step_idx < self.num_spec_tokens:
             context["draft_step_idx"] = next_step_idx
             context["enqueued"] = False
+            task_id = getattr(scheduler_output, "mtp_draft_task_id", None)
+            if task_id is not None:
+                self._queue_pending_mtp_draft_task(task_id)
         else:
             context["draft_complete"] = True
 
