@@ -151,6 +151,29 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                         self.response_mqs.append(local_message_queue)
                     else:
                         remote_message_queue = self.workers[0].peer_worker_response_mqs[rank]
+                        if remote_message_queue is None:
+                            peer_mqs = self.workers[0].peer_worker_response_mqs
+                            logger.error(
+                                "remote response mq missing: rank=%s, "
+                                "world_size=%s, local_world_size=%s, "
+                                "global_start_rank=%s, node_rank_within_dp=%s, "
+                                "enable_edge_cloud=%s, is_edge_node=%s, "
+                                "is_cloud_node=%s, peer_mq_type=%s, "
+                                "peer_mq_keys=%s, peer_mq_len=%s",
+                                rank,
+                                self.world_size,
+                                self.local_world_size,
+                                global_start_rank,
+                                self.parallel_config.node_rank_within_dp,
+                                self.parallel_config.enable_edge_cloud,
+                                self.parallel_config.is_edge_node,
+                                self.parallel_config.is_cloud_node,
+                                type(peer_mqs),
+                                (list(peer_mqs.keys()) if hasattr(peer_mqs, "keys")
+                                 else None),
+                                (len(peer_mqs) if hasattr(peer_mqs, "__len__")
+                                 else None),
+                            )
                         assert remote_message_queue is not None
                         self.response_mqs.append(remote_message_queue)
             elif is_ascend_non_leader_passive_engine_core(self.vllm_config):
