@@ -292,7 +292,8 @@ class AscendWorkerProc(WorkerProc):
             )
             self.worker_response_mq, self.peer_response_handles = (
                 get_inner_dp_world_group().create_single_reader_mq_broadcasters(
-                    reader_rank_in_group=0
+                    reader_rank_in_group=0,
+                    vllm_config=vllm_config,
                 )
             )
         else:
