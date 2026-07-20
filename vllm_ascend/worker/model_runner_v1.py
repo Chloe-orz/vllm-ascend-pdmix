@@ -2513,14 +2513,19 @@ class NPUModelRunner(GPUModelRunner):
             return True
         if method != "mtp":
             return False
+        if getattr(self, "_is_qwen3_5", False):
+            return True
         model_config = getattr(self.vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
         model_type = str(getattr(hf_config, "model_type", "")).lower()
-        return "qwen" in model_type and "mtp" in model_type
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        architecture_text = " ".join(str(arch).lower() for arch in architectures)
+        return "qwen" in model_type or "qwen" in architecture_text
 
-    def _should_skip_qwen_mtp_drafter_dummy_run(self) -> bool:
+    def _should_skip_mtp_drafter_dummy_run(self) -> bool:
         return (
-            self._is_qwen_mtp_spec_decode()
+            self.speculative_config is not None
+            and getattr(self.speculative_config, "method", None) == "mtp"
             and getattr(self, "_edge_cloud_enabled", False)
             and getattr(self.edge_cloud_cfg, "role", None) == "edge"
             and is_edge_device()
@@ -5754,7 +5759,7 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter and not self._should_skip_qwen_mtp_drafter_dummy_run():
+            if self.drafter and not self._should_skip_mtp_drafter_dummy_run():
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -5825,7 +5830,7 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states = outputs
                 dummy_compute_logits(hidden_states)
 
-                if self.drafter and not self._should_skip_qwen_mtp_drafter_dummy_run():
+                if self.drafter and not self._should_skip_mtp_drafter_dummy_run():
                     self.drafter.dummy_run(
                         num_tokens=num_tokens_padded,
                         with_prefill=with_prefill,
