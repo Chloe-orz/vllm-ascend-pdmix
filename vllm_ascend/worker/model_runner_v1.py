@@ -2518,6 +2518,15 @@ class NPUModelRunner(GPUModelRunner):
         model_type = str(getattr(hf_config, "model_type", "")).lower()
         return "qwen" in model_type and "mtp" in model_type
 
+    def _should_skip_qwen_mtp_drafter_dummy_run(self) -> bool:
+        return (
+            self._is_qwen_mtp_spec_decode()
+            and getattr(self, "_edge_cloud_enabled", False)
+            and getattr(self.edge_cloud_cfg, "role", None) == "edge"
+            and is_edge_device()
+            and getattr(self, "drafter", None) is not None
+        )
+
     def _should_defer_qwen_mtp_draft(
         self, scheduler_output: "SchedulerOutput"
     ) -> bool:
@@ -2566,6 +2575,15 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_mtp_draft_contexts[task_id] = context
         self._queue_pending_mtp_draft_task(task_id)
         self._draft_token_ids = None
+        if os.environ.get("VLLM_ASCEND_MTP_DEBUG_TRACE") == "1":
+            logger.info(
+                "[MTP-DEBUG] create draft task after %s: task_id=%s, "
+                "req_ids=%s, num_spec_tokens=%s, current_step=0",
+                scheduler_output.batch_type,
+                task_id,
+                context["req_ids"],
+                self.num_spec_tokens,
+            )
         logger.debug(
             "Deferred Qwen-MTP draft after %s, task_id=%s, req_ids=%s",
             scheduler_output.batch_type,
@@ -2619,6 +2637,18 @@ class NPUModelRunner(GPUModelRunner):
             mtp_draft_task_id=task_id,
             draft_step_idx=draft_step_idx,
         )
+        if os.environ.get("VLLM_ASCEND_MTP_DEBUG_TRACE") == "1":
+            logger.info(
+                "[MTP-DEBUG] build SchedulerOutput: batch_type=%s, "
+                "task_id=%s, parent_req_id=%s, step=%s, req_ids=%s, "
+                "hidden_channel=%s",
+                scheduler_output.batch_type,
+                task_id,
+                req_ids[0],
+                draft_step_idx,
+                req_ids,
+                scheduler_output.hidden_channel,
+            )
         logger.debug(
             "Prepared Qwen-MTP draft scheduler output, task_id=%s, "
             "parent_req_id=%s, step=%s, req_ids=%s",
@@ -2894,8 +2924,22 @@ class NPUModelRunner(GPUModelRunner):
             task_id = getattr(scheduler_output, "mtp_draft_task_id", None)
             if task_id is not None:
                 self._queue_pending_mtp_draft_task(task_id)
+                if os.environ.get("VLLM_ASCEND_MTP_DEBUG_TRACE") == "1":
+                    logger.info(
+                        "[MTP-DEBUG] requeue draft task: task_id=%s, "
+                        "next_step=%s/%s",
+                        task_id,
+                        next_step_idx,
+                        self.num_spec_tokens,
+                    )
         else:
             context["draft_complete"] = True
+            if os.environ.get("VLLM_ASCEND_MTP_DEBUG_TRACE") == "1":
+                logger.info(
+                    "[MTP-DEBUG] draft task complete: task_id=%s, steps=%s",
+                    getattr(scheduler_output, "mtp_draft_task_id", None),
+                    self.num_spec_tokens,
+                )
 
         req_ids = list(context["req_ids"])
         return ModelRunnerOutput(
@@ -5710,7 +5754,7 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter:
+            if self.drafter and not self._should_skip_qwen_mtp_drafter_dummy_run():
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -5781,7 +5825,7 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states = outputs
                 dummy_compute_logits(hidden_states)
 
-                if self.drafter:
+                if self.drafter and not self._should_skip_qwen_mtp_drafter_dummy_run():
                     self.drafter.dummy_run(
                         num_tokens=num_tokens_padded,
                         with_prefill=with_prefill,
