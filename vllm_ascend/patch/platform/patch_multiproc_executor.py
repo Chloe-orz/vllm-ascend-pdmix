@@ -158,7 +158,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                                 "world_size=%s, local_world_size=%s, "
                                 "global_start_rank=%s, node_rank_within_dp=%s, "
                                 "enable_edge_cloud=%s, is_edge_node=%s, "
-                                "is_cloud_node=%s, peer_mq_type=%s, "
+                                "peer_mq_type=%s, "
                                 "peer_mq_keys=%s, peer_mq_len=%s",
                                 rank,
                                 self.world_size,
@@ -167,7 +167,6 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                                 self.parallel_config.node_rank_within_dp,
                                 self.parallel_config.enable_edge_cloud,
                                 self.parallel_config.is_edge_node,
-                                self.parallel_config.is_cloud_node,
                                 type(peer_mqs),
                                 (list(peer_mqs.keys()) if hasattr(peer_mqs, "keys")
                                  else None),
