@@ -2522,7 +2522,14 @@ class NPUModelRunner(GPUModelRunner):
         architecture_text = " ".join(str(arch).lower() for arch in architectures)
         return "qwen" in model_type or "qwen" in architecture_text
 
-    def _should_skip_mtp_drafter_dummy_run(self) -> bool:
+    def _is_edge_cloud_mtp_edge_without_draft_kv(self) -> bool:
+        """Return true when the edge side owns no MTP decoder KV cache.
+
+        PR #29 loads the MTP drafter with edge-cloud layer range 0/0:
+        draft decoder layers run on cloud, while edge keeps only the input
+        preparation and logits path.  In that split, edge-side startup must not
+        initialize or profile the drafter as if it had local attention layers.
+        """
         return (
             self.speculative_config is not None
             and getattr(self.speculative_config, "method", None) == "mtp"
@@ -5759,7 +5766,7 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter and not self._should_skip_mtp_drafter_dummy_run():
+            if self.drafter and not self._is_edge_cloud_mtp_edge_without_draft_kv():
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -5830,7 +5837,7 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states = outputs
                 dummy_compute_logits(hidden_states)
 
-                if self.drafter and not self._should_skip_mtp_drafter_dummy_run():
+                if self.drafter and not self._is_edge_cloud_mtp_edge_without_draft_kv():
                     self.drafter.dummy_run(
                         num_tokens=num_tokens_padded,
                         with_prefill=with_prefill,
@@ -6064,7 +6071,10 @@ class NPUModelRunner(GPUModelRunner):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
             block_size = (self.kernel_block_sizes[0] if isinstance(
             self.kernel_block_sizes, list) else self.kernel_block_sizes)
-            self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+            # With the PR #29 MTP split, edge owns no draft decoder attention
+            # layers, so there is no local draft KV backend to initialize.
+            if not self._is_edge_cloud_mtp_edge_without_draft_kv():
+                self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
@@ -6961,8 +6971,29 @@ class NPUModelRunner(GPUModelRunner):
         attention_backends: list[set[type[AttentionBackend]]],
         kv_cache_groups: list[KVCacheGroupSpec],
     ) -> None:
+        speculative_config = self.speculative_config
+        skip_parent_drafter_init = (
+            speculative_config is not None
+            and getattr(speculative_config, "method", None) == "mtp"
+            and getattr(self, "_edge_cloud_enabled", False)
+        )
         with update_pass_config(self):
-            super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
+            if skip_parent_drafter_init:
+                # The paired vLLM branch treats method=mtp as an Eagle-like
+                # proposer in the parent class and asserts against upstream
+                # proposer types.  Ascend MTP uses its own proposer wrapper, so
+                # let the parent update target-model graph metadata first, then
+                # initialize drafter graph keys explicitly below.
+                self.speculative_config = None
+            try:
+                super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
+            finally:
+                self.speculative_config = speculative_config
+
+        if skip_parent_drafter_init and getattr(self, "drafter", None) is not None:
+            self.drafter.initialize_cudagraph_keys(
+                self.cudagraph_dispatcher.cudagraph_mode
+            )
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
         capture_sizes = sorted({
