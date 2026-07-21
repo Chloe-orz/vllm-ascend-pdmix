@@ -6068,12 +6068,29 @@ class NPUModelRunner(GPUModelRunner):
         if self.speculative_config and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
-            block_size = (self.kernel_block_sizes[0] if isinstance(
-            self.kernel_block_sizes, list) else self.kernel_block_sizes)
+            # Only the PP last rank owns a drafter.  Other ranks still see
+            # speculative_config, but have no draft model to initialize.
+            if self.drafter is None:
+                pass
             # With the PR #29 MTP split, edge owns no draft decoder attention
             # layers, so there is no local draft KV backend to initialize.
-            if not self._is_edge_cloud_mtp_edge_without_draft_kv():
+            elif self._is_edge_cloud_mtp_edge_without_draft_kv():
+                logger.info(
+                    "[EdgeCloud] edge MTP drafter has no local decoder KV; "
+                    "skip drafter attention backend initialization."
+                )
+            else:
+                assert isinstance(
+                    self.drafter,
+                    AscendEagleProposer
+                    | AscendDflashProposer
+                    | AscendDraftModelProposer,
+                )
+                block_size = (
+                    self.kernel_block_sizes[0]
+                    if isinstance(self.kernel_block_sizes, list)
+                    else self.kernel_block_sizes
+                )
                 self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
