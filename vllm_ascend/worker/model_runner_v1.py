@@ -808,6 +808,11 @@ class NPUModelRunner(GPUModelRunner):
         # Saved in execute_model() so sample_tokens() can access scheduler_output
         # for edge-cloud mamba state sync (especially on the cloud side).
         self._last_scheduler_output: "SchedulerOutput | None" = None
+        # True only while the parent target-model graph capture loop is
+        # running, including its per-shape eager warmups. Edge-cloud drafters
+        # that actually run eagerly are profiled before this phase and must not
+        # perform cross-node dummy communication from inside target capture.
+        self._edge_cloud_target_capture_in_progress = False
 
         # Latest cloud-side target metadata for draft paths that do not cross
         # an independent scheduling boundary.
@@ -6950,7 +6955,18 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter:
+            is_scheduled_edge_cloud_draft = (
+                self._edge_cloud_enabled
+                and self.speculative_config is not None
+                and self.speculative_config.method in ("mtp", "eagle3")
+            )
+            skip_eager_edge_cloud_drafter = (
+                self._edge_cloud_target_capture_in_progress
+                and is_scheduled_edge_cloud_draft
+                and self.drafter is not None
+                and not self.drafter.use_cuda_graph
+            )
+            if self.drafter and not skip_eager_edge_cloud_drafter:
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -6961,6 +6977,12 @@ class NPUModelRunner(GPUModelRunner):
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                )
+            elif skip_eager_edge_cloud_drafter:
+                logger.info_once(
+                    "[EdgeCloud][GraphCapture] Skipping eager %s drafter "
+                    "dummy run during target graph capture.",
+                    self.speculative_config.method,
                 )
             if is_profile and self.dynamic_eplb:
                 target = self.model.language_model if hasattr(self.model, "language_model") else self.model
@@ -7216,26 +7238,36 @@ class NPUModelRunner(GPUModelRunner):
             self.need_accepted_tokens = False
             self.may_reinitialize_input_batch(kv_cache_config)
             self.kv_cache = {}
-            # Initialize cudagraph dispatcher keys + ACL graph params ONLY for the
-            # MTP edge-cloud path. The MTP drafter segments (_edge_cloud_mtp_segments)
-            # rely on graph_params being set here; without it ACL graph capture/replay
-            # hangs. (Mirrors the `method == "mtp"` guard in _check_and_update_cudagraph_mode.)
+            # A scheduled edge-cloud draft participates in the parent capture
+            # loop only when the loaded drafter actually uses ACL graphs. In
+            # that case the edge needs the same dispatcher keys and graph params
+            # as the cloud so their per-shape draft dummy communication stays
+            # aligned.
             #
-            # DO NOT run this for the non-MTP embedding_only edge. Passing empty
-            # attention backends leaves min_cg_support at ALWAYS, which initializes
-            # the dispatcher keys (keys_initialized=True) and makes dispatch() return
-            # FULL instead of NONE. That flips the edge decode tail (segment_e) from
-            # eager into ACL-graph capture/replay and adds a per-step
-            # update_full_graph_params sync, costing ~2% throughput (94 -> 92 token/s)
-            # and hurting the edge/cloud overlap under --async-scheduling. The edge
-            # tail has no attention layers, so eager is both correct and faster here
-            # -- this is exactly the pre-MTP behavior.
+            # Do not initialize these keys for an eager drafter. Its normal
+            # profile_run has already executed before target capture, and
+            # _dummy_run skips it while target capture is in progress. Keeping
+            # the dispatcher uninitialized also leaves the otherwise-empty
+            # embedding_only edge target segments on the eager path.
             if (
                 self.speculative_config is not None
-                and self.speculative_config.method == "mtp"
+                and self.speculative_config.method in ("mtp", "eagle3")
+                and self.drafter is not None
+                and self.drafter.use_cuda_graph
             ):
                 self._check_and_update_cudagraph_mode(
                     [], kv_cache_config.kv_cache_groups
+                )
+                capture_sizes = sorted({
+                    desc.num_tokens
+                    for _, descs in self.cudagraph_dispatcher.get_capture_descs()
+                    for desc in descs
+                })
+                logger.info(
+                    "[EdgeCloud][GraphCapture] embedding_only edge initialized "
+                    "graph-backed %s draft participation for sizes=%s",
+                    self.speculative_config.method,
+                    capture_sizes,
                 )
             logger.info(
                 "[EdgeCloud] embedding_only edge skipped KV cache tensor "
@@ -8256,9 +8288,14 @@ class NPUModelRunner(GPUModelRunner):
         # 因此这里手动清空，强制重新 capture。
         for wrapper in self._get_aclgraph_wrappers():
             wrapper.concrete_aclgraph_entries.clear()
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            result = GPUModelRunner.capture_model(self)
-        return result
+        self._edge_cloud_target_capture_in_progress = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
+                parent_module_name
+            ):
+                return GPUModelRunner.capture_model(self)
+        finally:
+            self._edge_cloud_target_capture_in_progress = False
 
     def _prepare_multimodal_fields(self):
         """
