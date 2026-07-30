@@ -936,7 +936,7 @@ class PassiveScheduler:
                         self._active_sliced_prefill.total_num_scheduled_tokens
                         if self._active_sliced_prefill else 0
                     ),
-                    new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE,
+                    new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT,
                     throttle_action="start",
                 )
             if self.ready_prefills:
@@ -945,7 +945,7 @@ class PassiveScheduler:
                     batch_type=_so.batch_type,
                     dispatch_queue="ready_prefills",
                     token_count=_so.total_num_scheduled_tokens,
-                    new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE,
+                    new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT,
                     throttle_action="start",
                 )
             if self.ready_decodes:
@@ -992,7 +992,7 @@ class PassiveScheduler:
         if self.ready_pdmixes:
             _so = self.ready_pdmixes[0]
             _blocked = (
-                state == CloudSchedulingState.EXPECT_EXECUTE_DECODE
+                state == CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT
                 and not self._can_fallback_to_prefill_in_decode_state()
             )
             if not _blocked:
@@ -1002,7 +1002,7 @@ class PassiveScheduler:
                     token_count=_so.total_num_scheduled_tokens,
                     throttle_action=(
                         "start"
-                        if state == CloudSchedulingState.EXPECT_EXECUTE_DECODE
+                        if state == CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT
                         else None
                     ),
                 )
