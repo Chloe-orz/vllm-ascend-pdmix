@@ -81,6 +81,7 @@ class SchedulerDecision:
     token_count: int = 0                    # total_num_scheduled_tokens (0 for dummy)
     new_state: CloudSchedulingState | None = None  # EEP → EED transition hint
     throttle_action: str | None = None      # "start" / "clear" / None
+    cloud_suggest_slicing: bool | None = None  # edge hint to enable prefill slicing
 
 
 @dataclass
@@ -532,9 +533,10 @@ class PassiveScheduler:
         )
 
     def _do_slice(
-        self, so: SchedulerOutput, token_count: int = 0,
+        self, so: SchedulerOutput, decision: "SchedulerDecision | None" = None,
     ) -> list["LayerSliceInfo | None"]:
         """Compute layer slices for a prefill-like batch."""
+        token_count = decision.token_count if decision and decision.token_count > 0 else 0
         _tk = token_count if token_count > 0 else so.total_num_scheduled_tokens
         total_slices = self._resolve_slice_count(_tk)
         # [DIAG] Log the resolved slice count with DP + step context so the
@@ -562,7 +564,7 @@ class PassiveScheduler:
         ]
 
     def _slice_for(
-        self, so: SchedulerOutput, token_count: int = 0,
+        self, so: SchedulerOutput, decision: "SchedulerDecision | None" = None,
     ) -> list["LayerSliceInfo | None"]:
         # Decode-like and empty batches are never sliced. DECODE_FIRST is the
         # edge-cloud head segment of a decode step — same per-token shape as
@@ -577,11 +579,17 @@ class PassiveScheduler:
         # [方案B] Cloud 侧决策：
         # 1. 已有 decode 到达 Cloud → 强制切层（确定性收益）
         if self.ready_decodes:
-            return self._do_slice(so, token_count)
+            return self._do_slice(so, decision)
 
         # 2. Edge 建议切层（decode 正在路上）→ 切层
-        if getattr(so, "cloud_suggest_slicing", False):
-            return self._do_slice(so, token_count)
+        #    decision.cloud_suggest_slicing 优先，为 None 时回退到 so.cloud_suggest_slicing
+        _cloud_suggest = (
+            decision.cloud_suggest_slicing
+            if decision and decision.cloud_suggest_slicing is not None
+            else getattr(so, "cloud_suggest_slicing", False)
+        )
+        if _cloud_suggest:
+            return self._do_slice(so, decision)
 
         # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
@@ -952,6 +960,9 @@ class PassiveScheduler:
                     ),
                     new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT,
                     throttle_action="start",
+                    cloud_suggest_slicing=getattr(
+                        self._active_sliced_prefill, "cloud_suggest_slicing", None
+                    ) if self._active_sliced_prefill else None,
                 )
             if self.ready_prefills:
                 _so = self.ready_prefills[0]
@@ -961,6 +972,7 @@ class PassiveScheduler:
                     token_count=_so.total_num_scheduled_tokens,
                     new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT,
                     throttle_action="start",
+                    cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
                 )
             if self.ready_decodes:
                 _so = self.ready_decodes[0]
@@ -969,6 +981,7 @@ class PassiveScheduler:
                     dispatch_queue="ready_decodes",
                     token_count=_so.total_num_scheduled_tokens,
                     throttle_action="clear",
+                    cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
                 )
         else:  # EXPECT_EXECUTE_DECODE
             if self.ready_decodes:
@@ -979,6 +992,7 @@ class PassiveScheduler:
                     token_count=_so.total_num_scheduled_tokens,
                     new_state=CloudSchedulingState.EXPECT_EXECUTE_PREFILL,
                     throttle_action="clear",
+                    cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
                 )
             if self._can_fallback_to_prefill_in_decode_state():
                 if self._active_prefill_slices:
@@ -993,6 +1007,9 @@ class PassiveScheduler:
                             if self._active_sliced_prefill else 0
                         ),
                         throttle_action="start",
+                        cloud_suggest_slicing=getattr(
+                            self._active_sliced_prefill, "cloud_suggest_slicing", None
+                        ) if self._active_sliced_prefill else None,
                     )
                 if self.ready_prefills:
                     _so = self.ready_prefills[0]
@@ -1001,6 +1018,7 @@ class PassiveScheduler:
                         dispatch_queue="ready_prefills",
                         token_count=_so.total_num_scheduled_tokens,
                         throttle_action="start",
+                        cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
                     )
 
         if self.ready_pdmixes:
@@ -1019,6 +1037,7 @@ class PassiveScheduler:
                         if state == CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT
                         else None
                     ),
+                    cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
                 )
 
         return SchedulerDecision()
@@ -1117,6 +1136,7 @@ class PassiveScheduler:
                 token_count=winner_decision.token_count,
                 new_state=winner_decision.new_state,
                 throttle_action=winner_decision.throttle_action,
+                cloud_suggest_slicing=winner_decision.cloud_suggest_slicing,
             )
         return winner_decision
 
@@ -1179,7 +1199,7 @@ class PassiveScheduler:
                         len(self.ready_prefills),
                     )
                 return self._build_batch(self.ready_prefills.popleft(),
-                                         decision.token_count)
+                                         decision)
             if _bt is not None:
                 logger.info(
                     "[APPLY-DECISION] branch=prefill-dummy "
@@ -1202,7 +1222,7 @@ class PassiveScheduler:
                         len(self.ready_decodes),
                     )
                 return self._build_batch(self.ready_decodes.popleft(),
-                                         decision.token_count)
+                                         decision)
             if _bt is not None:
                 logger.info(
                     "[APPLY-DECISION] branch=decode-dummy "
@@ -1225,7 +1245,7 @@ class PassiveScheduler:
                         len(self.ready_pdmixes),
                     )
                 return self._build_batch(self.ready_pdmixes.popleft(),
-                                         decision.token_count)
+                                         decision)
             if _bt is not None:
                 logger.info(
                     "[APPLY-DECISION] branch=pdmix-dummy "
@@ -1269,8 +1289,9 @@ class PassiveScheduler:
             return self._build_batch(q.popleft())
         return ScheduledBatch.empty()
 
-    def _build_batch(self, so: SchedulerOutput, token_count: int = 0) -> ScheduledBatch:
-        slices = self._slice_for(so, token_count)
+    def _build_batch(self, so: SchedulerOutput,
+                     decision: "SchedulerDecision | None" = None) -> ScheduledBatch:
+        slices = self._slice_for(so, decision)
         if len(slices) <= 1:
             batch = ScheduledBatch(scheduler_output=so, slices=slices)
         else:
