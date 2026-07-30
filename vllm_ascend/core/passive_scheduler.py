@@ -808,6 +808,12 @@ class PassiveScheduler:
     def _schedule_expect_alternation_simple(self) -> ScheduledBatch:
         """Original single-DP EEP/EED state machine (no cross-DP coord)."""
         state = self.cloud_scheduling_state
+        self._log_queue_state("simple-enter")
+        logger.error(
+            "[COORD-DIAG] DP%s simple-enter state=%s",
+            getattr(self.vllm_config.parallel_config, "data_parallel_rank", 0),
+            state.name,
+        )
         if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
             if self._active_prefill_slices:
                 self.cloud_scheduling_state = (
@@ -931,7 +937,7 @@ class PassiveScheduler:
         )
         logger.error(
             "[COORD-DIAG] DP%s %s bt=%s cont=%s tok=%s "
-            "new_state=%s throttle=%s queue=%s",
+            "new_state=%s throttle=%s queue=%s slice=%s",
             _dp_rank, tag,
             decision.batch_type.value if decision.batch_type else "EMPTY",
             decision.is_continuation,
@@ -939,6 +945,8 @@ class PassiveScheduler:
             decision.new_state.name if decision.new_state else "-",
             decision.throttle_action or "-",
             decision.dispatch_queue or "-",
+            decision.cloud_suggest_slicing
+            if decision.cloud_suggest_slicing is not None else "-",
         )
 
     def _make_decision_alternation(self) -> SchedulerDecision:
