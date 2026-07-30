@@ -7179,16 +7179,6 @@ class NPUModelRunner(GPUModelRunner):
                     "edge" if is_edge_device() else "cloud",
                     _peer_bt, _skip_head, _skip_tail,
                 )
-            if self.use_aux_hidden_state_outputs:
-                if isinstance(outputs, IntermediateTensors):
-                    hidden_states = outputs["hidden_states"]
-                else:
-                    hidden_states, _ = outputs
-            elif isinstance(outputs, IntermediateTensors):
-                hidden_states = outputs["hidden_states"]
-            else:
-                hidden_states = outputs
-            dummy_compute_logits(hidden_states)
 
             if not _skip_head:
                 with set_ascend_forward_context(
@@ -7233,12 +7223,17 @@ class NPUModelRunner(GPUModelRunner):
                         layer_slice_info=layer_slice_info,
                         **_model_kwargs,
                     )
+
                 if self.use_aux_hidden_state_outputs:
-                    hidden_states, _ = outputs
+                    if isinstance(outputs, IntermediateTensors):
+                        hidden_states = outputs["hidden_states"]
+                    else:
+                        hidden_states, _ = outputs
                 elif isinstance(outputs, IntermediateTensors):
                     hidden_states = outputs["hidden_states"]
                 else:
                     hidden_states = outputs
+
                 # Layer-sliced dummy: save intermediate state for the
                 # next slice (mirrors execute_model's layerwise state
                 # saving for real prefill).
