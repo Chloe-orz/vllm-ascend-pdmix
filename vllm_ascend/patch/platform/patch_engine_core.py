@@ -531,7 +531,8 @@ def _uses_scheduled_edge_cloud_draft(self) -> bool:
     if method != "mtp":
         return False
     hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
-    return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
+    model_type = str(getattr(hf_config, "model_type", "")).lower()
+    return "qwen" in model_type or model_type == "deepseek_v4"
 
 
 def _has_unresolved_edge_cloud_draft_parent(self) -> bool:

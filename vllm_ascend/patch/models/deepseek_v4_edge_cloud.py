@@ -43,6 +43,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.sequence import IntermediateTensors
 
@@ -50,6 +51,36 @@ from vllm_ascend.models.deepseek_v4 import (
     AscendDeepseekV4ForCausalLM,
     DeepseekV4Model,
 )
+
+
+def _stash_mtp_target_hidden_states(
+    model: DeepseekV4Model,
+    hidden_states: torch.Tensor,
+) -> None:
+    """Refresh the pre-hc_head target state consumed by DeepSeek-V4 MTP."""
+    mtp_hidden_buffer = getattr(model, "_mtp_hidden_buffer", None)
+    if mtp_hidden_buffer is None:
+        return
+
+    from vllm_ascend.ascend_forward_context import get_forward_context
+
+    forward_ctx = get_forward_context()
+    hidden_states_flat = hidden_states.flatten(1)
+    if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+        hidden_states_flat = tensor_model_parallel_all_gather(
+            hidden_states_flat,
+            dim=0,
+        )
+        if forward_ctx.pad_size > 0:
+            hidden_states_flat = hidden_states_flat[:-forward_ctx.pad_size]
+
+    num_tokens = hidden_states_flat.shape[0]
+    if num_tokens > mtp_hidden_buffer.shape[0]:
+        raise RuntimeError(
+            "DeepSeek-V4 MTP target hidden state exceeds its persistent "
+            f"buffer: tokens={num_tokens}, capacity={mtp_hidden_buffer.shape[0]}"
+        )
+    mtp_hidden_buffer[:num_tokens].copy_(hidden_states_flat)
 
 
 def _forward_edge_cloud_segment_v4(
@@ -60,6 +91,8 @@ def _forward_edge_cloud_segment_v4(
     positions: torch.Tensor,
     intermediate_tensors: IntermediateTensors | None = None,
     inputs_embeds: torch.Tensor | None = None,
+    is_first_segment: bool | None = None,
+    is_last_segment: bool | None = None,
     **extra_layer_kwargs: Any,
 ) -> torch.Tensor | IntermediateTensors:
     """Edge-cloud segment forward for DeepSeek-V4.
@@ -78,13 +111,19 @@ def _forward_edge_cloud_segment_v4(
         ``hidden_states`` for the last segment.
     """
     num_layers = len(self.layers)
-    assert 0 <= start_layer < end_layer <= num_layers, (
+    assert 0 <= start_layer <= end_layer <= num_layers, (
         f"Invalid segment range: [{start_layer}, {end_layer}) "
         f"for {num_layers} layers"
     )
 
-    is_first_segment = (start_layer == 0 and get_pp_group().is_first_rank)
-    is_last_segment = (end_layer == num_layers and get_pp_group().is_last_rank)
+    if is_first_segment is None:
+        is_first_segment = (
+            start_layer == 0 and get_pp_group().is_first_rank
+        )
+    if is_last_segment is None:
+        is_last_segment = (
+            end_layer == num_layers and get_pp_group().is_last_rank
+        )
 
     # ----- Embedding or restore intermediate state -----
     if is_first_segment:
@@ -109,7 +148,7 @@ def _forward_edge_cloud_segment_v4(
     # llama_4_scaling is currently None because scaling config is not enabled.
     # When enabled, compute it from config (see DeepseekV4Model.forward).
     llama_4_scaling = None
-    for idx, layer in enumerate(islice(self.layers, start_layer, end_layer)):
+    for layer in islice(self.layers, start_layer, end_layer):
         hidden_states, residual = layer(
             positions,
             hidden_states,
@@ -126,20 +165,24 @@ def _forward_edge_cloud_segment_v4(
     if not is_last_segment:
         # residual keeps its original (n, hc_mult, h) shape, aligned with
         # standard forward path and make_empty_intermediate_tensors buffer.
+        if residual is None:
+            # embedding_only has a zero-layer segment A. Keep the wire
+            # payload tensor-only and aligned with the regular layer output.
+            residual = torch.zeros_like(hidden_states)
         return IntermediateTensors({
             "hidden_states": hidden_states,
             "residual": residual,
         })
 
-    # Last segment: hc_head + norm
+    # Last segment: preserve the pre-HC residual stream for the MTP drafter,
+    # then apply the target model's hc_head + norm as in the stock forward.
+    _stash_mtp_target_hidden_states(self, hidden_states)
     hidden_states = self.hc_head(
         hidden_states,
         self.hc_head_fn,
         self.hc_head_scale,
         self.hc_head_base,
     )
-
-
     hidden_states = self.norm(hidden_states)
     return hidden_states
 
