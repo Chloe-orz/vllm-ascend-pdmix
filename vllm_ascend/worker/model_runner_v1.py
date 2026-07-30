@@ -524,6 +524,15 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_edge_cloud_draft_contexts: dict[
             str, dict[str, Any]
         ] = {}
+        # Draft token IDs consumed by each in-flight async verify batch,
+        # keyed by the verify head_token (shared by the DF head segment and
+        # the DL tail segment).  With several request groups in flight,
+        # another draft chain can overwrite the global self._draft_token_ids
+        # before this verify's tail executes, so the deferred-draft stash
+        # must look the tokens up per verify instead of reading the global.
+        self._verified_draft_token_ids_by_head: dict[
+            str, tuple[list[str] | None, torch.Tensor]
+        ] = {}
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1929,6 +1938,26 @@ class NPUModelRunner(GPUModelRunner):
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        if (
+            self.use_async_scheduling
+            and scheduler_output.head_token
+            and scheduler_output.scheduled_spec_decode_tokens
+            and torch.is_tensor(self._draft_token_ids)
+        ):
+            # Snapshot the worker-local draft token IDs this verify batch
+            # just consumed (they were scattered into input_ids.gpu above).
+            # The matching DECODE_LAST tail shares this head_token and can
+            # execute after another draft chain overwrote the global
+            # self._draft_token_ids, so the deferred-draft stash must use
+            # this per-verify entry instead of the global.
+            verified_by_head = self._verified_draft_token_ids_by_head
+            while len(verified_by_head) >= 8:
+                # Bound the map; entries are popped by their tail batch.
+                verified_by_head.pop(next(iter(verified_by_head)))
+            verified_by_head[scheduler_output.head_token] = (
+                getattr(self, "_draft_token_ids_req_ids", None),
+                self._draft_token_ids,
+            )
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2848,6 +2877,55 @@ class NPUModelRunner(GPUModelRunner):
             sample_row_indices[req_idx] = end - 1 - num_rejected[req_idx]
             start = end
 
+        # Async scheduled MTP: the scheduler only sent fixed-length -1
+        # placeholder spec tokens, so the spec region of token_ids_cpu read
+        # above holds placeholders (native vLLM only ever repairs them on
+        # the GPU side in _prepare_input_ids).  The real draft token ids are
+        # worker-local -- the same tensor that was scattered into
+        # input_ids.gpu for this verify forward.  Patch the spec rows here
+        # so the first draft step embeds the true verified draft tokens
+        # instead of placeholder embeddings; otherwise the draft hidden
+        # states/KV diverge from the non-placeholder semantics and the
+        # acceptance pattern changes even though the target verify (and
+        # thus the output text) is unaffected.
+        #
+        # Prefer the per-verify snapshot recorded when this batch's head
+        # segment consumed the drafts: with several request groups in
+        # flight, another draft chain may have overwritten the global
+        # self._draft_token_ids before this tail batch executes.
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        worker_draft_token_ids = self._draft_token_ids
+        draft_req_ids = getattr(self, "_draft_token_ids_req_ids", None)
+        verified_entry = self._verified_draft_token_ids_by_head.pop(
+            task_id, None
+        )
+        if verified_entry is not None:
+            draft_req_ids, worker_draft_token_ids = verified_entry
+        if (
+            self.use_async_scheduling
+            and scheduled_spec_tokens
+            and torch.is_tensor(worker_draft_token_ids)
+        ):
+            worker_draft_cpu = worker_draft_token_ids.detach().cpu()
+            start = 0
+            for req_idx, n in enumerate(num_scheduled):
+                end = start + n
+                draft_len = len(scheduled_spec_tokens.get(req_ids[req_idx], ()))
+                if 0 < draft_len <= n:
+                    row = req_idx
+                    if draft_req_ids is not None:
+                        try:
+                            row = draft_req_ids.index(req_ids[req_idx])
+                        except ValueError:
+                            start = end
+                            continue
+                    if row < worker_draft_cpu.shape[0]:
+                        take = min(draft_len, worker_draft_cpu.shape[1])
+                        scheduled_token_ids[end - take : end] = (
+                            worker_draft_cpu[row, :take].to(torch.long)
+                        )
+                start = end
+
         frozen_sampled_token_ids = _freeze_scheduled_state(
             sampled_token_ids
         )
@@ -2891,7 +2969,6 @@ class NPUModelRunner(GPUModelRunner):
             context["next_token_ids"] = torch.tensor(
                 next_token_list, dtype=torch.long
             )
-        self._draft_token_ids = None
         logger.info(
             "[MTP-DEBUG] pending draft context stashed: task_id=%s, "
             "req_ids=%s, draft_step_idx=%s, pending_contexts=%d",
@@ -2900,6 +2977,17 @@ class NPUModelRunner(GPUModelRunner):
             context["draft_step_idx"],
             len(self._pending_edge_cloud_draft_contexts),
         )
+        # Only clear the global draft-token buffer when this stash actually
+        # consumed the tensor it still references.  In async mode another
+        # request group's chain may already have replaced it with drafts a
+        # later verify batch still needs (its DECODE_FIRST scatters the
+        # global directly); clearing here would corrupt that verify.
+        if not self.use_async_scheduling or (
+            verified_entry is not None
+            and verified_entry[1] is self._draft_token_ids
+        ):
+            self._draft_token_ids = None
+            self._draft_token_ids_req_ids = None
 
     def clear_pending_edge_cloud_draft_for_req_ids(
         self, req_ids: set[str] | list[str]
@@ -3180,13 +3268,28 @@ class NPUModelRunner(GPUModelRunner):
             # task or follow-up control RPC is needed.
         else:
             self._draft_token_ids = torch.stack(draft_steps, dim=1)
+            # Rows of _draft_token_ids follow this context's request order;
+            # remember it so the deferred-draft context stash can map rows
+            # back to requests even if the input batch was re-indexed since.
+            self._draft_token_ids_req_ids = list(context["req_ids"])
+            logger.info(
+                "[DRAFT-OUT] task=%s drafts=%s",
+                scheduler_output.draft_task_id,
+                self._draft_token_ids.tolist(),
+            )
 
         req_ids = list(context["req_ids"])
         if next_step_idx >= self.num_spec_tokens:
-            completed_draft_token_ids = DraftTokenIds(
-                req_ids,
-                self._draft_token_ids.detach().cpu().tolist(),
-            )
+            # Native async spec-decode semantics: keep the real draft token
+            # IDs in the worker.  The already queued next target batch carries
+            # fixed-length placeholders and _prepare_input_ids scatters this
+            # tensor into the actual verify inputs after this DRL executes.
+            # Avoid the device->CPU->EngineCore->scheduler round trip entirely.
+            if not self.use_async_scheduling:
+                completed_draft_token_ids = DraftTokenIds(
+                    req_ids,
+                    self._draft_token_ids.detach().cpu().tolist(),
+                )
             task_id = scheduler_output.draft_task_id
             assert task_id is not None
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
@@ -4358,21 +4461,12 @@ class NPUModelRunner(GPUModelRunner):
                     or self._uses_scheduled_edge_cloud_draft()
                 )
             ):
-                num_reqs = sampler_output.sampled_token_ids.size(0)
-                num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
-                tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
-                if (
-                    self._uses_scheduled_edge_cloud_draft()
-                    and self.valid_sampled_token_count_gpu is not None
-                ):
-                    tensor_dict_to_send["valid_sampled_token_count"] = (
-                        self.valid_sampled_token_count_gpu.cpu()
-                    )
                 if self._should_defer_edge_cloud_draft(scheduler_output):
-                    # Deferred edge-cloud draft: carry the small CPU state on
-                    # the ModelRunnerOutput already returning to EngineCore.
-                    # The scheduler can then create step-0 DRAFT_FIRST without
-                    # a second executor RPC.
+                    # The async output already copies sampled_token_ids to the
+                    # host. EngineCore derives both accepted-count fields from
+                    # that existing result. Do not add another synchronous
+                    # D2H here: the edge does not consume these cloud-only
+                    # scalars, and the next local DRAFT_FIRST is already queued.
                     task_id = scheduler_output.head_token
                     context = (
                         self._pending_edge_cloud_draft_contexts.get(task_id)
@@ -4384,25 +4478,19 @@ class NPUModelRunner(GPUModelRunner):
                             "Deferred edge-cloud draft context missing for "
                             f"head_token={task_id}"
                         )
-                    valid_count = tensor_dict_to_send.get(
-                        "valid_sampled_token_count"
-                    )
                     edge_cloud_draft_state = {
                         "draft_task_id": task_id,
                         "draft_step_idx": 0,
-                        "num_accepted_tokens": [
-                            int(value) for value in num_accepted.tolist()
-                        ],
-                        "valid_sampled_token_count": (
-                            [
-                                int(value)
-                                for value in valid_count.tolist()
-                            ]
-                            if valid_count is not None
-                            else None
-                        ),
                     }
                 elif get_pp_group().world_size == 2:
+                    num_accepted = (
+                        (sampler_output.sampled_token_ids != -1)
+                        .sum(dim=1)
+                        .cpu()
+                    )
+                    tensor_dict_to_send = {
+                        "num_accepted_tokens": num_accepted
+                    }
                     send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
                     for handle in send_work:
                         handle.wait()
