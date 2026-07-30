@@ -1194,16 +1194,6 @@ class NPUWorker(WorkerBase):
                                             dst=_send_dst),
                 channel=channel,
             )
-            import sys as _hang_sys
-            logger.error("[HANG] cloud return isend EXIT: dp_rank=%s channel=%s",
-                        _hang_ret_rank, channel.value)
-            _hang_sys.stderr.flush()
-            logger.error(
-                "[PP-EVT] CLOUD-SEND dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
-                _hang_ret_rank, scheduler_output.batch_type.value,
-                getattr(scheduler_output, "head_token", "?"),
-                channel.value, scheduler_output.total_num_scheduled_tokens,
-            )
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output
 
