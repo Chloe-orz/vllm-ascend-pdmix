@@ -528,14 +528,15 @@ class PassiveScheduler:
         )
 
     def _do_slice(
-        self, so: SchedulerOutput
+        self, so: SchedulerOutput, token_count: int = 0,
     ) -> list["LayerSliceInfo | None"]:
         """Compute layer slices for a prefill-like batch."""
-        total_slices = self._resolve_slice_count(
-            so.total_num_scheduled_tokens
-        )
+        _tk = token_count if token_count > 0 else so.total_num_scheduled_tokens
+        total_slices = self._resolve_slice_count(_tk)
+        # Slicing disabled or trivially 1 slice.
         if total_slices <= 1:
             return [None]
+
         boundaries = self._compute_slice_boundaries(
             self._num_local_layers, total_slices
         )
@@ -557,21 +558,14 @@ class PassiveScheduler:
         ):
             return [None]
 
-        # wangwei，需要调试if self.ready_decodes:
-        _tk = token_count if token_count > 0 else so.total_num_scheduled_tokens
-        total_slices = self._resolve_slice_count(_tk)
-        # Slicing disabled or trivially 1 slice.
-        if total_slices <= 1:
-            return [None]
-
         # [方案B] Cloud 侧决策：
         # 1. 已有 decode 到达 Cloud → 强制切层（确定性收益）
         if self.ready_decodes:
-            return self._do_slice(so)
+            return self._do_slice(so, token_count)
 
         # 2. Edge 建议切层（decode 正在路上）→ 切层
         if getattr(so, "cloud_suggest_slicing", False):
-            return self._do_slice(so)
+            return self._do_slice(so, token_count)
 
         # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
