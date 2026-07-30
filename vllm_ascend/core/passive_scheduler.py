@@ -1109,43 +1109,58 @@ class PassiveScheduler:
         if winner_rank == -1:
             return SchedulerDecision()  # all idle
 
-        # Phase 2: all_reduce(MAX) transmits the winner's FULL
-        # SchedulerDecision (batch_type, dispatch_queue, is_continuation,
-        # token_count, new_state, throttle_action).
-        # Non-winners zero-fill their buffer; MAX(0, bytes) = bytes
-        # preserves the winner's data untouched.
-        _MAX_SER_LEN = 4096
-        buf_tensor = torch.zeros(_MAX_SER_LEN, dtype=torch.uint8,
+        # Phase 2: all_reduce(SUM) transmits EVERY DP's full
+        # SchedulerDecision.  Each DP writes pickled(decision) into its
+        # own per-rank slot; SUM with zero-filled peer slots preserves
+        # each rank's data untouched.  One all-reduce round, all
+        # decisions available locally on every rank afterwards.
+        _BUF_PER_DP = 4096
+        buf_tensor = torch.zeros(_dp_size * _BUF_PER_DP, dtype=torch.uint8,
                                   device="cpu")
-        if _dp_rank == winner_rank:
-            data = pickle.dumps(decision)
-            if len(data) > _MAX_SER_LEN:
-                raise RuntimeError(
-                    f"SchedulerDecision serialized size "
-                    f"{len(data)} > {_MAX_SER_LEN}"
-                )
-            buf_tensor[:len(data)] = torch.tensor(
-                list(data), dtype=torch.uint8
+        data = pickle.dumps(decision)
+        if len(data) > _BUF_PER_DP:
+            raise RuntimeError(
+                f"SchedulerDecision serialized size "
+                f"{len(data)} > {_BUF_PER_DP}"
             )
+        offset = _dp_rank * _BUF_PER_DP
+        buf_tensor[offset:offset + len(data)] = torch.tensor(
+            list(data), dtype=torch.uint8
+        )
 
-        dist.all_reduce(buf_tensor, op=dist.ReduceOp.MAX,
+        dist.all_reduce(buf_tensor, op=dist.ReduceOp.SUM,
                          group=self.dp_coord_group)
 
-        data = bytes(buf_tensor.tolist()).rstrip(b'\x00')
-        winner_decision: SchedulerDecision = pickle.loads(data)
+        # Decode each DP's decision from its slot.
+        def _decode_slot(r: int) -> SchedulerDecision:
+            start = r * _BUF_PER_DP
+            raw = bytes(buf_tensor[start : start + _BUF_PER_DP].tolist())
+            raw = raw.rstrip(b'\x00')
+            return pickle.loads(raw) if raw else SchedulerDecision()
 
-        # Non-winner DPs inherit the winner's decision wholesale to stay
-        # in lockstep.
-        if _dp_rank != winner_rank:
-            return SchedulerDecision(
-                batch_type=winner_decision.batch_type,
-                dispatch_queue=winner_decision.dispatch_queue,
-                is_continuation=winner_decision.is_continuation,
-                token_count=winner_decision.token_count,
-                new_state=winner_decision.new_state,
-                throttle_action=winner_decision.throttle_action,
-                cloud_suggest_slicing=winner_decision.cloud_suggest_slicing,
-            )
+        all_decisions = [_decode_slot(r) for r in range(_dp_size)]
+        local_decision = all_decisions[_dp_rank]
+        winner_raw = all_decisions[winner_rank]
+
+        # Merge cloud_suggest_slicing: if any DP has a hint (True),
+        # all DPs use it.  Walking in rank order guarantees both sides
+        # pick the same value.
+        merged_suggest: bool | None = None
+        for dec in all_decisions:
+            if dec.cloud_suggest_slicing is not None:
+                merged_suggest = dec.cloud_suggest_slicing
+                break
+
+        winner_decision = SchedulerDecision(
+            batch_type=winner_raw.batch_type,
+            dispatch_queue=winner_raw.dispatch_queue,
+            is_continuation=winner_raw.is_continuation,
+            token_count=winner_raw.token_count,
+            new_state=winner_raw.new_state,
+            throttle_action=winner_raw.throttle_action,
+            cloud_suggest_slicing=merged_suggest,
+        )
+
         return winner_decision
 
     def _apply_decision_alternation(
