@@ -181,6 +181,10 @@ class PassiveScheduler:
         # [DIAG] Track DECODE_FIRST arrival intervals on the cloud side.
         self._last_decode_first_arrival_ts: float | None = None
 
+        # [DIAG] Engine-tick counter; incremented once per schedule() call so
+        # slice / DP decisions can be correlated across logs by step number.
+        self._step: int = 0
+
         # Precompute local layer count.  The actual slice count is resolved
         # per-batch from a YAML config (token threshold -> slice count).
         self._num_local_layers = 0
@@ -533,6 +537,18 @@ class PassiveScheduler:
         """Compute layer slices for a prefill-like batch."""
         _tk = token_count if token_count > 0 else so.total_num_scheduled_tokens
         total_slices = self._resolve_slice_count(_tk)
+        # [DIAG] Log the resolved slice count with DP + step context so the
+        # per-tick slicing decision can be correlated across cloud DPs.
+        _dp_rank = getattr(
+            self.vllm_config.parallel_config, "data_parallel_rank", "?"
+        )
+        _dp_size = getattr(
+            self.vllm_config.parallel_config, "data_parallel_size", 1
+        )
+        logger.info(
+            "[SLICE-DIAG] step=%s dp_rank=%s/%s total_slices=%s tokens=%s",
+            self._step, _dp_rank, _dp_size, total_slices, _tk,
+        )
         # Slicing disabled or trivially 1 slice.
         if total_slices <= 1:
             return [None]
@@ -630,6 +646,10 @@ class PassiveScheduler:
         slices.  Draft priority is enforced inside the state machine, not via
         an early out-of-band check.
         """
+        # [DIAG] One step per engine tick so slice/DP decisions can be
+        # correlated across logs.  Incremented here (the single per-tick
+        # entry point) regardless of which dispatch path is taken.
+        self._step += 1
         if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
             return self._schedule_expect_alternation()
 
