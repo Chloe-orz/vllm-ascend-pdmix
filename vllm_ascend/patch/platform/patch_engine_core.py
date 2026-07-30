@@ -840,94 +840,93 @@ def _patched_step_with_batch_queue(self):
                 scheduler_output = self.scheduler.schedule()
             self._hang_last_bt = str(scheduler_output.batch_type)
 
-        # [ascend insert] Assign head-token for edge-cloud head-segment
-        # batches so the tail-segment can be matched to the suspended
-        # state.
-        self._ensure_pd_head_token(scheduler_output)
+            # [ascend insert] Assign head-token for edge-cloud head-segment
+            # batches so the tail-segment can be matched to the suspended
+            # state.
+            self._ensure_pd_head_token(scheduler_output)
 
-        # [ascend insert] Publish head-segment batches immediately at
-        # schedule time to keep the pipeline full.
-        if scheduler_output.batch_type in (
-            BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST
-        ):
-            self._maybe_publish_pre_out(scheduler_output)
-        elif scheduler_output.batch_type in (
-            BatchType.PREFILL_LAST, BatchType.DECODE_LAST
-        ):
-            # [方案③-fix Part 2] tail segment is edge-local (no real cloud
-            # zmq). In the NON-coordinated path the peer DP's dummy goes to
-            # cloud, so publish a dummy-middle zmq to keep the cloud-side
-            # cross-DP all_reduce pairing 1:1.
-            # Under cross-DP coordination BOTH DPs run the same tail bt this
-            # step, so both clouds are idle (tail is edge-only) and pair
-            # naturally - skip the dummy zmq (publishing it would only desync
-            # the cloud PassiveScheduler state machine).
-            _dp_gt1 = getattr(
-                self.vllm_config.parallel_config, 'data_parallel_size', 1
-            ) > 1
-            if _dp_gt1 and not _coordinated:
-                self._publish_pd_dummy_zmq()
+            # [ascend insert] Publish head-segment batches immediately at
+            # schedule time to keep the pipeline full.
+            if scheduler_output.batch_type in (
+                BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST
+            ):
+                self._maybe_publish_pre_out(scheduler_output)
+            elif scheduler_output.batch_type in (
+                BatchType.PREFILL_LAST, BatchType.DECODE_LAST
+            ):
+                # [方案③-fix Part 2] tail segment is edge-local (no real cloud
+                # zmq). In the NON-coordinated path the peer DP's dummy goes to
+                # cloud, so publish a dummy-middle zmq to keep the cloud-side
+                # cross-DP all_reduce pairing 1:1.
+                # Under cross-DP coordination BOTH DPs run the same tail bt this
+                # step, so both clouds are idle (tail is edge-only) and pair
+                # naturally - skip the dummy zmq (publishing it would only desync
+                # the cloud PassiveScheduler state machine).
+                _dp_gt1 = getattr(
+                    self.vllm_config.parallel_config, 'data_parallel_size', 1
+                ) > 1
+                if _dp_gt1 and not _coordinated:
+                    self._publish_pd_dummy_zmq()
 
-        if scheduler_output.batch_type == BatchType.EMPTY:
-            if batch_queue:
-                self._defer_empty_batch(scheduler_output)
-                scheduler_output = None
-            else:
-                return self._finish_empty_batch(scheduler_output)
-
-        if scheduler_output is not None:
-            self._merge_pending_worker_cleanup(scheduler_output)
-
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            if self.is_ec_consumer:
-                model_executed = (
-                    scheduler_output.total_num_scheduled_tokens > 0
-                )
-
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            elif not self._needs_sample_tokens(scheduler_output):
-                # [ascend insert] Edge-cloud head segment (PF/DF): sampling is
-                # done in the tail segment (PL/DL) after the cloud returns
-                # intermediate tensors. Skip sample_tokens for the head
-                # segment.
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+            if scheduler_output.batch_type == BatchType.EMPTY:
+                if batch_queue:
+                    self._defer_empty_batch(scheduler_output)
+                    scheduler_output = None
                 else:
-                    deferred_scheduler_output = scheduler_output
+                    return self._finish_empty_batch(scheduler_output)
 
-            if not deferred_scheduler_output:
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                # [ascend insert] Log batch_queue contents for debugging.
-                queue_types = [
-                    so.batch_type.value
-                    for _, so, _ in batch_queue
-                ]
-                vllm_logger.info(
-                    "[PP-EVT][BATCH_QUEUE] step_cnt=%d Enqueued %s, queue_len=%d, types=%s",
-                    self.step_cnt,
-                    scheduler_output.batch_type.value,
-                    len(batch_queue),
-                    queue_types,
-                )
-                if (
-                    model_executed
-                    and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
-                ):
-                    return None, True
+            if scheduler_output is not None:
+                self._merge_pending_worker_cleanup(scheduler_output)
 
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+                if self.is_ec_consumer:
+                    model_executed = (
+                        scheduler_output.total_num_scheduled_tokens > 0
+                    )
+
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                elif not self._needs_sample_tokens(scheduler_output):
+                    # [ascend insert] Edge-cloud head segment (PF/DF): sampling is
+                    # done in the tail segment (PL/DL) after the cloud returns
+                    # intermediate tensors. Skip sample_tokens for the head
+                    # segment.
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    # [ascend insert] Log batch_queue contents for debugging.
+                    queue_types = [
+                        so.batch_type.value
+                        for _, so, _ in batch_queue
+                    ]
+                    vllm_logger.info(
+                        "[PP-EVT][BATCH_QUEUE] step_cnt=%d Enqueued %s, queue_len=%d, types=%s",
+                        self.step_cnt,
+                        scheduler_output.batch_type.value,
+                        len(batch_queue),
+                        queue_types,
+                    )
+                    if (
+                        model_executed
+                        and len(batch_queue) < self.batch_queue_size
+                        and not batch_queue[-1][0].done()
+                    ):
+                        return None, True
         elif not batch_queue:
             return None, False
 
