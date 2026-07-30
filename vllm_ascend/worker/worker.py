@@ -580,50 +580,22 @@ class NPUWorker(WorkerBase):
                         channel.value, len(handles))
             self._pp_send_work_by_channel[channel.value] = handles
 
-    def _wait_pp_send_work(
-        self,
-        channel: HiddenChannelType | None = None,
-        wait: bool = True,
-    ) -> None:
-        # When wait=False (edge-cloud path), do NOT call handle.wait() on the
-        # isend handles - just drop them. ProcessGroupHCCL internally records
-        # isend inputs on the hccl stream (pointToPoint ->
-        # NPUCachingAllocator::recordStream(tensor, hcclStream),
-        # ProcessGroupHCCL.cpp:4585), so the send buffer's lifetime is safe
-        # without an explicit wait. Calling handle.wait() here would do
-        # hcclEndEvent.block(currentStream=compute/default) (see
-        # WorkHCCL::synchronizeInternal, ProcessGroupHCCL.cpp:1001), re-pinning
-        # the isend completion onto the compute stream regardless of which
-        # Python _pps stream the isend was submitted on - defeating the
-        # per-channel x per-direction _pps split. The compute stream would then
-        # stall until the remote (edge) irecvs the previous P尾, which in 2P1D
-        # (edge busy with the other DP / idle) never happens in time ->
-        # deadlock (log symptom: pre_recv=False recv=False). MindIE discards
-        # the isend handle (_ = isend(...)) for the same reason; this matches
-        # that. Legacy PP keeps wait=True to preserve the original synchronous
-        # behavior.
+    def _wait_pp_send_work(self, channel: HiddenChannelType | None = None) -> None:
         if channel is None:
-            if wait:
-                for handle in self._pp_send_work:
-                    handle.wait()
-                for handles in self._pp_send_work_by_channel.values():
-                    for handle in handles:
-                        handle.wait()
+            for handle in self._pp_send_work:
+                handle.wait()
             self._pp_send_work = []
+            for handles in self._pp_send_work_by_channel.values():
+                for handle in handles:
+                    handle.wait()
             self._pp_send_work_by_channel.clear()
             return
 
         handles = self._pp_send_work_by_channel.pop(channel.value, [])
-<<<<<<< HEAD
         logger.info("[PD] _wait_pp_send_work: channel=%s handles=%d",
                     channel.value, len(handles))
         for handle in handles:
             handle.wait()
-=======
-        if wait:
-            for handle in handles:
-                handle.wait()
->>>>>>> 537238d1 (feat(ascend): 实现跨DP批次类型协调与PP通信优化)
 
     # ------------------------------------------------------------------ #
     # [CHER/EHER] Cloud/edge hidden early-receive primitives             #
@@ -824,9 +796,9 @@ class NPUWorker(WorkerBase):
                 BatchType.DECODE_LAST,
                 BatchType.DRAFT_LAST,
             ):
-                self._wait_pp_send_work(self._hidden_channel_for(scheduler_output), wait=False)
+                self._wait_pp_send_work(self._hidden_channel_for(scheduler_output))
             else:
-                self._wait_pp_send_work(wait=False)
+                self._wait_pp_send_work()
         else:
             self._wait_pp_send_work()
 
@@ -839,12 +811,11 @@ class NPUWorker(WorkerBase):
                 return self._execute_model_cloud(
                     scheduler_output, layer_slice_info
                 )
-<<<<<<< HEAD
             if bt == BatchType.DRAFT_FIRST:
                 return self._execute_model_edge_draft_head(scheduler_output)
             if bt == BatchType.DRAFT_LAST:
                 return self._execute_model_edge_draft_tail(scheduler_output)
-=======
+
             # PD-separation dummy (cross-DP coordination): tokens==0 means
             # this edge runs a dummy of the winner bt to pair the [0,5] EP
             # all-toall. _dummy_run matches the peer's real segment via
@@ -852,7 +823,7 @@ class NPUWorker(WorkerBase):
             # No isend/recv - the dummy carries no real hidden states.
             if scheduler_output.total_num_scheduled_tokens == 0:
                 return self._execute_model_edge_dummy(scheduler_output)
->>>>>>> 537238d1 (feat(ascend): 实现跨DP批次类型协调与PP通信优化)
+
             if bt in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
                 return self._execute_model_edge_head(
                     scheduler_output, layer_slice_info

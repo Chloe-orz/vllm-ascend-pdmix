@@ -676,6 +676,81 @@ def _patched_step_with_batch_queue(self):
             self._drain_pd_channel_inbox()
 
             scheduler_output = self.scheduler.schedule()
+
+            # [ascend insert] Assign head-token for edge-cloud head-segment
+            # batches so the tail-segment can be matched to the suspended
+            # state.
+            self._ensure_pd_head_token(scheduler_output)
+
+            # [ascend insert] Publish head-segment batches immediately at
+            # schedule time to keep the pipeline full.
+            if scheduler_output.batch_type in (
+                BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST
+            ):
+                self._maybe_publish_pre_out(scheduler_output)
+
+            if scheduler_output.batch_type == BatchType.EMPTY:
+                if batch_queue:
+                    self._defer_empty_batch(scheduler_output)
+                    scheduler_output = None
+                else:
+                    return self._finish_empty_batch(scheduler_output)
+
+            if scheduler_output is not None:
+                self._merge_pending_worker_cleanup(scheduler_output)
+
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+                if self.is_ec_consumer:
+                    model_executed = (
+                        scheduler_output.total_num_scheduled_tokens > 0
+                    )
+
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                elif not self._needs_sample_tokens(scheduler_output):
+                    # [ascend insert] Edge-cloud head segment (PF/DF): sampling is
+                    # done in the tail segment (PL/DL) after the cloud returns
+                    # intermediate tensors. Skip sample_tokens for the head
+                    # segment.
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    # [ascend insert] Log batch_queue contents for debugging.
+                    queue_types = [
+                        so.batch_type.value
+                        for _, so, _ in batch_queue
+                    ]
+                    vllm_logger.info(
+                        "[BATCH_QUEUE] Enqueued %s, queue_len=%d, types=%s",
+                        scheduler_output.batch_type.value,
+                        len(batch_queue),
+                        queue_types,
+                    )
+                    if (
+                        model_executed
+                        and len(batch_queue) < self.batch_queue_size
+                        and not batch_queue[-1][0].done()
+                    ):
+                        return None, True
+
+        elif not batch_queue:
+            return None, False
+
     else:
         # [ascend insert] Pull cloud-returned tail-segment batches into the
         # scheduler ready queues BEFORE coord/intent. This MUST run every step
@@ -853,8 +928,8 @@ def _patched_step_with_batch_queue(self):
                 ):
                     return None, True
 
-    elif not batch_queue:
-        return None, False
+        elif not batch_queue:
+            return None, False
 
     # Block until the next result is available.
     future, scheduler_output, exec_model_fut = batch_queue.pop()
