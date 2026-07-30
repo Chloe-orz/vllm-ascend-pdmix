@@ -3458,10 +3458,17 @@ class NPUModelRunner(GPUModelRunner):
         if _fast_path:
             # Pop this head_token's cache so a later segment_a (different
             # head_token) does not hand the wrong attn_metadata to this PL.
+            # `cache` must be the frozen _edge_prepare_cache_by_token entry:
+            # only it stores the cloned `positions` snapshot restored below
+            # (see `positions = cache["positions"]`), since _preprocess reads
+            # the runner's reusable positions buffer that an interleaved batch
+            # may have rewritten. The parallel _edge_prepare_cache entry is
+            # popped for cleanup only - it holds no positions and is not
+            # frozen, so it must not become `cache`.
+            self._edge_prepare_cache.pop(_tail_head_token, None)
             cache = self._edge_prepare_cache_by_token.pop(
                 scheduler_output.head_token
             )
-            cache = self._edge_prepare_cache.pop(_tail_head_token)
             # consumed: only this head_token's entry is removed; other
             # in-flight prefills' caches are preserved for 2P1D.
             total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
