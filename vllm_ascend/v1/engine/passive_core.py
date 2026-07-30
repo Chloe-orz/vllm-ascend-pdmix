@@ -748,6 +748,9 @@ class PassiveEngineCoreProc:
                 if slice_info is not None
                 else (worker_scheduler_output,)
             )
+            bt = batch.scheduler_output.batch_type.value
+            logger.info("[CLOUD-MQ] About to enqueue batch_type=%s", bt)
+            _t0 = time.monotonic()
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
