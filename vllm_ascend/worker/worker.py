@@ -1072,66 +1072,12 @@ class NPUWorker(WorkerBase):
             layer_slice_info is None or layer_slice_info.is_first_slice
         )
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-<<<<<<< HEAD
         # Always run _update_states for the first slice (or unsliced batch),
         # even when total_num_scheduled_tokens==0.  Some requests may not
         # contribute tokens to this slice but their state must still be
         # initialised in the cloud worker's all_token_ids, otherwise a
         # subsequent DECODE_FIRST / DRAFT_FIRST will KeyError in _update_states.
         if is_first_slice:
-=======
-        if forward_pass and is_first_slice:
-            # Pre-compute input preparation while edge runs segment_a.
-            # This overlaps cloud's _update_states, _prepare_inputs,
-            # _determine_batch_execution_and_padding, and
-            # _build_attention_metadata with edge's segment_a forward.
-            # On the merge_payload fast path the per-key tensors are
-            # materialized lazily inside comm_postprocess (after the
-            # merged buffer is split), so SP chunking must run there too
-            # — an eager chunk here would iterate an empty dict, rebind
-            # the variable, and sever the link to the postprocess that
-            # fills the original dict by reference (broken tokens).
-            do_sp_chunk = enable_sp() and (
-                self.model_runner.edge_cloud_cfg.mode != "embedding_only"
-                or not self.model_runner.supports_mm_inputs)
-            merge_payload = get_edge_cloud_tensor_meta().merge_payload
-            channel = self._hidden_channel_for(scheduler_output)
-            # In the shared-model edge-cloud topology the edge
-            # has a single distributed rank at in-group rank 0;
-            # the cloud first-worker of each dp_rank must
-            # receive the head-layer intermediate tensors from
-            # that single edge rank. Pass the explicit
-            # ``src=0`` so the receive is routed to the edge
-            # rather than the implicit "previous PP rank"
-            # (which would not point at the edge for cloud
-            # first-workers past the first one).
-            _hang_cld_rank = getattr(self.model_runner, "dp_rank", "?")
-            logger.error(
-                "[HANG] cloud recv ENTER: dp_rank=%s channel=%s tokens=%s",
-                _hang_cld_rank, channel.value,
-                scheduler_output.total_num_scheduled_tokens,
-            )
-            import sys as _hang_sys
-            _hang_sys.stderr.flush()
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
-                num_tokens=scheduler_output.total_num_scheduled_tokens,
-                channel=channel,
-                sp_chunk=do_sp_chunk and merge_payload,
-                src=0,
-            )
-            logger.error(
-                "[HANG] cloud recv EXIT: dp_rank=%s channel=%s",
-                _hang_cld_rank, channel.value,
-            )
-            _hang_sys.stderr.flush()
-            logger.error(
-                "[PP-EVT] CLOUD-RECV dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
-                _hang_cld_rank, scheduler_output.batch_type.value,
-                getattr(scheduler_output, "head_token", "?"),
-                channel.value, scheduler_output.total_num_scheduled_tokens,
-            )
-
->>>>>>> 537238d1 (feat(ascend): 实现跨DP批次类型协调与PP通信优化)
             self.model_runner.cloud_prepare_early(scheduler_output)
         if forward_pass and is_first_slice:
             # [CHER] Atomically reuse the guard thread's early-recv entry, or
@@ -1241,29 +1187,7 @@ class NPUWorker(WorkerBase):
         # resolves to the implicit "next PP rank" which IS the edge.
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
-<<<<<<< HEAD
             _send_dst = 0 if self.parallel_config.is_shared_model_edge else None
-=======
-            _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
-            # PD-separation diagnostic: log cloud output shape only.
-            # Do NOT compute .norm()/.mean().item() here: .item() is a full
-            # stream sync (aclrtSynchronizeStream). In eager mode the compute
-            # stream still has the pending cross-DP MoE a2a wait_event from the
-            # middle forward, so the full sync stalls until that a2a pairs
-            # across DPs; with both DPs hitting this .item() it forms a 2-way
-            # deadlock (DP0 .item -> DP0 a2a -> DP1 a2a -> DP1 .item -> ...).
-            # acl_graph avoids it because the a2a runs on the graph stream, not
-            # the compute stream, so syncing the compute stream doesn't wait for
-            # it. This is the same real-side full-sync cycle the 0722 work
-            # removed for A/C/D; B was missed/re-added. Real side must stay
-            # sync-free (dummy side keeps the .item() 节拍器). shape is sync-free.
-            _hs_c = _gathered.get("hidden_states")
-            if _hs_c is not None:
-                logger.error(
-                    "[PD-DIAG] B. cloud middle OUTPUT: bt=%s shape=%s",
-                    scheduler_output.batch_type, list(_hs_c.shape),
-                )
->>>>>>> 537238d1 (feat(ascend): 实现跨DP批次类型协调与PP通信优化)
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens,
