@@ -659,10 +659,17 @@ def _patched_step_with_batch_queue(self):
     # gate the one-time log purely on the flag (+ _dp_parallel_logged).
     _dp_parallel = getattr(self, "_dp_parallel", None)
     if _dp_parallel is None:
-        _dp_parallel = getattr(
+        # DP-parallel is configured only when data_parallel_size > 1. For DP=1
+        # leave _dp_parallel as None (do NOT cache the `> 1` bool) so the
+        # `if _dp_parallel is None:` branch below -- the simple, draft-guarded
+        # path that yields correct MTP output -- is taken. Caching a bool here
+        # makes `is None` always False and dead-codes that branch (878918df
+        # regression: MTP draft race -> 不说人话).
+        if getattr(
             self.vllm_config.parallel_config, "data_parallel_size", 1
-        ) > 1
-        self._dp_parallel = _dp_parallel
+        ) > 1:
+            _dp_parallel = True
+            self._dp_parallel = _dp_parallel
 
     model_executed = False
     deferred_scheduler_output = None
