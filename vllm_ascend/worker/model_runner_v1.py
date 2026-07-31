@@ -849,7 +849,13 @@ class NPUModelRunner(GPUModelRunner):
         self._cloud_spec_decode_metadata_by_task: dict[
             str, tuple[AscendCommonAttentionMetadata, int]
         ] = {}
-        self._cloud_spec_decode_metadata_cache_max: int = 8
+        # Bound sized for long-sequence (e.g. 64k) multi-request runs where the
+        # draft chain can legitimately lag several verify steps behind.  Too
+        # small a bound evicts an in-flight task's metadata; the matching
+        # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
+        # cloud never sends the DRAFT_LAST response, deadlocking the edge's
+        # matching recv on the shared DECODE channel.
+        self._cloud_spec_decode_metadata_cache_max: int = 32
         # Same per-task treatment for the verify step's scheduler_output:
         # the independently scheduled draft task applies the
         # num_accepted / mamba state correction, and by then
@@ -3174,9 +3180,32 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors,
     ) -> ModelRunnerOutput:
-        context = self._get_pending_edge_cloud_draft_context(
-            scheduler_output
+        task_id = scheduler_output.draft_task_id
+        context = (
+            self._pending_edge_cloud_draft_contexts.get(task_id)
+            if task_id else None
         )
+        if context is None:
+            # Drain: the owning request finished/aborted after its
+            # DRAFT_FIRST was already dispatched to the cloud.  The cloud
+            # does not track request lifecycle, so it still ran the draft
+            # middle segment and isend the DRAFT_LAST response; the recv in
+            # _execute_model_edge_draft_tail already consumed it to keep the
+            # DECODE hidden channel paired.  With no draft context there is
+            # no tail-segment compute to run (the result would be discarded
+            # anyway), so return a token-less placeholder and let
+            # update_from_output skip the gone request.
+            logger.info(
+                "[PD] drain stale DRAFT_LAST task_id=%s step=%s "
+                "(request gone, draft context cleared)",
+                task_id,
+                scheduler_output.draft_step_idx,
+            )
+            req_ids = list(scheduler_output.num_scheduled_tokens)
+            return ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            )
         draft_step_idx = int(scheduler_output.draft_step_idx or 0)
         positions = context.get("current_draft_positions")
         if positions is None:

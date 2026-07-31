@@ -1,0 +1,330 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the DRAFT_FIRST -> DRAFT_LAST alternation invariant and the
+drain path that pairs the cloud's DRAFT_LAST response when the owning request
+finishes or is aborted mid-chain.
+
+Regression coverage for the edge-side MTP draft deadlock fixes:
+
+  * ``_can_schedule_draft_first`` (pre-generated branch) now respects
+    ``_force_draft_last`` -- a second DRAFT_FIRST may not be picked until the
+    preceding DRAFT_LAST is picked (which clears the flag).  Previously the
+    pre-generated branch omitted this guard, so a DRAFT_LAST dropped without
+    clearing the flag let a second DRAFT_FIRST through (two heads with no tail
+    on the shared DECODE channel -> cloud ``irecv`` deadlock).
+  * ``_is_stale_draft_output`` no longer exempts pre-generated dispatched
+    chains: once the owning request is gone, future (not-yet-dispatched)
+    DRAFT_FIRST heads are stale and must be skipped -- the edge can no longer
+    produce their payload (draft context cleared) and the cloud would otherwise
+    wait forever for data.
+  * ``_pick_draft_last_batch`` never drops a dispatched DRAFT_LAST; it drains
+    it (the cloud always ``isend``s a response, so the edge must ``irecv`` to
+    keep the DECODE channel paired) and only spawns a verify placeholder for a
+    live request.
+  * ``_run_edge_cloud_draft_last_segment`` drains (recv already done by the
+    caller, skip tail compute, return a token-less placeholder) when the draft
+    context is gone, instead of raising.
+"""
+
+from collections import deque
+from unittest.mock import MagicMock
+
+import pytest
+
+from vllm.v1.core.sched.output import BatchType, HiddenChannelType
+
+
+# ------------------------------------------------------------------ #
+# Helpers                                                            #
+# ------------------------------------------------------------------ #
+
+
+def _make_bare_scheduler():
+    from vllm_ascend.core.pd_separated_scheduler import PDSeparatedScheduler
+
+    s = PDSeparatedScheduler.__new__(PDSeparatedScheduler)
+    s.drafts_first_ready = deque()
+    s.drafts_last_ready = deque()
+    s.requests = {}
+    s._pregenerated_draft_task_ids = set()
+    s._pregenerated_draft_req_ids = {}
+    s._draft_first_dispatched = False
+    s._draft_first_cloud_publish_pending = None
+    s._draft_first_scalars_patched = False
+    s._draft_remote_pending_limit = 2
+    s.draft_remote_pending_count = 0
+    s.decode_or_draft_inflight_count = 0
+    s.decode_or_draft_inflight_limit = 1
+    s.decode_head_inflight_count = 0
+    s._force_draft_last = False
+    s._force_decode_last = False
+    s.num_spec_tokens = 3
+    return s
+
+
+def _make_draft_first(task_id="task-0", req_id="req-0", step=0):
+    so = MagicMock()
+    so.batch_type = BatchType.DRAFT_FIRST
+    so.draft_task_id = task_id
+    so.draft_step_idx = step
+    so.head_token = f"tok-{task_id}-{step}"
+    so.hidden_channel = HiddenChannelType.DECODE
+    so.num_scheduled_tokens = {req_id: 1}
+    so.parent_req_id = req_id
+    so.num_accepted_tokens = None
+    so.valid_sampled_token_count = None
+    return so
+
+
+def _make_draft_last(task_id="task-0", req_id="req-0", step=0):
+    so = MagicMock()
+    so.batch_type = BatchType.DRAFT_LAST
+    so.draft_task_id = task_id
+    so.draft_step_idx = step
+    so.head_token = f"tok-{task_id}-{step}"
+    so.hidden_channel = HiddenChannelType.DECODE
+    so.num_scheduled_tokens = {req_id: 1}
+    so.parent_req_id = req_id
+    return so
+
+
+# ------------------------------------------------------------------ #
+# Test: _can_schedule_draft_first honors _force_draft_last (fix ①)   #
+# ------------------------------------------------------------------ #
+
+
+class TestCanScheduleDraftFirstForceGuard:
+    """The pre-generated branch must gate on _force_draft_last just like the
+    legacy branch, so DRAFT_FIRST -> DRAFT_LAST alternation is guaranteed."""
+
+    def _setup(self, pregenerated=True):
+        s = _make_bare_scheduler()
+        drf = _make_draft_first()
+        s.drafts_first_ready.append(drf)
+        if pregenerated:
+            s._pregenerated_draft_task_ids.add(drf.draft_task_id)
+        # Conditions that would otherwise allow scheduling.
+        s.drafts_last_ready = deque()
+        s._force_decode_last = False
+        s._force_draft_last = False
+        s.draft_remote_pending_count = 0
+        s.decode_or_draft_inflight_count = 0
+        return s
+
+    def test_preGen_blocked_when_force_draft_last_true(self):
+        s = self._setup(pregenerated=True)
+        s._force_draft_last = True
+        assert s._can_schedule_draft_first() is False
+
+    def test_preGen_allowed_when_force_draft_last_false(self):
+        s = self._setup(pregenerated=True)
+        s._force_draft_last = False
+        assert s._can_schedule_draft_first() is True
+
+    def test_preGen_blocked_by_drafts_last_ready(self):
+        s = self._setup(pregenerated=True)
+        s._force_draft_last = False
+        s.drafts_last_ready.append(_make_draft_last())
+        assert s._can_schedule_draft_first() is False
+
+    def test_preGen_blocked_when_decode_head_in_flight(self):
+        """Regression for decode_or_draft_inflight=2/1: DRAFT_FIRST and
+        DECODE_FIRST use different recv primitives but share the DECODE
+        stream, so a DRAFT_FIRST must not be dispatched while a DECODE_FIRST
+        head is in flight (the cloud's recv order could mismatch the edge's
+        send order).  Gate on decode heads, not total heads."""
+        s = self._setup(pregenerated=True)
+        s._force_draft_last = False
+        s.decode_head_inflight_count = 1  # a DECODE_FIRST in flight
+        assert s._can_schedule_draft_first() is False
+        s.decode_head_inflight_count = 0
+        assert s._can_schedule_draft_first() is True
+
+    def test_preGen_allows_draft_pipeline_while_draft_in_flight(self):
+        """The next DRAFT_FIRST MAY be dispatched while a previous DRAFT_FIRST
+        is still in flight (draft pipelining): DRAFT_FIRST is an edge->cloud
+        send while DRAFT_LAST is a cloud->edge recv (opposite stream
+        directions), and draft+draft uses the same recv primitive (FIFO).
+        Only a DECODE_FIRST head blocks it, not another DRAFT_FIRST."""
+        s = self._setup(pregenerated=True)
+        s._force_draft_last = False  # previous DRAFT_LAST already picked
+        s.drafts_last_ready = deque()  # previous DRAFT_LAST popped (in flight)
+        s.decode_head_inflight_count = 0  # no DECODE_FIRST in flight
+        s.decode_or_draft_inflight_count = 1  # a DRAFT_FIRST in flight
+        s.draft_remote_pending_count = 1  # under the pipeline credit (<2)
+        assert s._can_schedule_draft_first() is True
+
+    def test_legacy_branch_also_blocked_by_force_draft_last(self):
+        """Non-pre-generated branch already had the guard (unchanged)."""
+        s = self._setup(pregenerated=False)
+        s._force_draft_last = True
+        assert s._can_schedule_draft_first() is False
+
+
+class TestDraftFirstLastAlternation:
+    """End-to-end gate check: a second DRAFT_FIRST is blocked while the first
+    DRAFT_LAST is pending, and admitted only after the tail is picked."""
+
+    def test_second_head_blocked_until_tail_picked(self):
+        s = _make_bare_scheduler()
+        s._pregenerated_draft_task_ids.add("task-0")
+        # step-0 head already picked; step-1 is next in drafts_first_ready.
+        s.drafts_first_ready.append(_make_draft_first(step=1))
+        s._force_decode_last = False
+        s.draft_remote_pending_count = 0
+
+        # DRAFT_FIRST step-0 in force + its DRAFT_LAST pending -> step-1 blocked.
+        s._force_draft_last = True
+        s.drafts_last_ready.append(_make_draft_last(step=0))
+        assert s._can_schedule_draft_first() is False
+
+        # DRAFT_LAST step-0 picked -> flag cleared, no tail pending -> allowed.
+        s._force_draft_last = False
+        s.drafts_last_ready.clear()
+        assert s._can_schedule_draft_first() is True
+
+
+# ------------------------------------------------------------------ #
+# Test: _draft_output_reqs_live / _is_stale_draft_output (fix ②d)    #
+# ------------------------------------------------------------------ #
+
+
+class TestDraftReqsLiveAndStale:
+    def _setup(self, req_present=True, req_id="req-0"):
+        s = _make_bare_scheduler()
+        if req_present:
+            s.requests[req_id] = MagicMock()
+        so = _make_draft_last(req_id=req_id)
+        return s, so
+
+    def test_live_request_reqs_live_true(self):
+        s, so = self._setup(req_present=True)
+        assert s._draft_output_reqs_live(so) is True
+
+    def test_dead_request_reqs_live_false(self):
+        s, so = self._setup(req_present=False)
+        assert s._draft_output_reqs_live(so) is False
+
+    def test_live_request_not_stale(self):
+        s, so = self._setup(req_present=True)
+        assert s._is_stale_draft_output(so) is False
+
+    def test_dead_request_stale(self):
+        s, so = self._setup(req_present=False)
+        assert s._is_stale_draft_output(so) is True
+
+    def test_preGen_dispatched_dead_request_still_stale(self):
+        """Regression for the removed override: a pre-generated, step-0-
+        dispatched chain whose request has since gone must still be treated
+        as stale for not-yet-dispatched heads.  Otherwise the edge picks and
+        dispatches heads it can no longer produce payload for (context
+        cleared) -> cloud waits forever for data that never arrives."""
+        s, so = self._setup(req_present=False)
+        s._pregenerated_draft_task_ids.add(so.draft_task_id)
+        s._draft_first_dispatched = True
+        assert s._is_stale_draft_output(so) is True
+
+
+# ------------------------------------------------------------------ #
+# Test: _pick_draft_last_batch drains instead of dropping (fix ②a)   #
+# ------------------------------------------------------------------ #
+
+
+class TestPickDraftLastBatchDrain:
+    """A DRAFT_LAST in drafts_last_ready always has its DRAFT_FIRST already
+    dispatched to the cloud, so the cloud will isend a response -- the edge
+    must execute (drain) the tail to pair it, never drop it."""
+
+    def _setup(self, req_present=True):
+        s = _make_bare_scheduler()
+        if req_present:
+            s.requests["req-0"] = MagicMock()
+        s.drafts_last_ready.append(_make_draft_last())
+        s._force_draft_last = True
+        s.draft_remote_pending_count = 1
+        # Stub side-effecting helpers to isolate the drain decision.
+        s._validate_draft_tail_channel = MagicMock()
+        s._start_decode_or_draft_first_only_window = MagicMock()
+        s._prepare_next_decode_first_placeholder = MagicMock()
+        s._make_empty_batch = MagicMock(return_value="EMPTY")
+        return s
+
+    def test_dead_request_drained_not_dropped(self):
+        s = self._setup(req_present=False)
+        before = s.draft_remote_pending_count
+        result = s._pick_draft_last_batch()
+
+        # The tail is returned (dispatched to the worker for drain), not
+        # dropped -- the cloud's response must be paired on the DECODE channel.
+        assert result.batch_type == BatchType.DRAFT_LAST
+        assert len(s.drafts_last_ready) == 0
+        # _force_draft_last is always reset now (the old stale-drop skipped it).
+        assert s._force_draft_last is False
+        # The decrement moved to update_from_output; _pick_draft_last_batch no
+        # longer decrements (the old stale-drop did).
+        assert s.draft_remote_pending_count == before
+        # No verify placeholder for a gone request.
+        s._prepare_next_decode_first_placeholder.assert_not_called()
+        s._validate_draft_tail_channel.assert_called_once()
+
+    def test_live_request_prepares_placeholder(self):
+        s = self._setup(req_present=True)
+        result = s._pick_draft_last_batch()
+        assert result.batch_type == BatchType.DRAFT_LAST
+        assert s._force_draft_last is False
+        s._prepare_next_decode_first_placeholder.assert_called_once()
+
+    def test_empty_returns_empty_batch(self):
+        s = self._setup(req_present=True)
+        s.drafts_last_ready.clear()
+        assert s._pick_draft_last_batch() == "EMPTY"
+        s._make_empty_batch.assert_called_once()
+
+
+# ------------------------------------------------------------------ #
+# Test: worker _run_edge_cloud_draft_last_segment drain (fix ②c)    #
+# ------------------------------------------------------------------ #
+
+
+class TestRunDraftLastSegmentDrain:
+    """When the draft context is gone (request finished/aborted after its
+    DRAFT_FIRST was dispatched), the tail segment must drain (the recv in
+    _execute_model_edge_draft_tail already paired the cloud response) and
+    return a token-less placeholder instead of raising."""
+
+    def _make_runner(self, context_present=False):
+        from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._pending_edge_cloud_draft_contexts = {}
+        if context_present:
+            runner._pending_edge_cloud_draft_contexts["task-0"] = MagicMock()
+        return runner
+
+    @staticmethod
+    def _make_so(task_id="task-0"):
+        so = MagicMock()
+        so.draft_task_id = task_id
+        so.draft_step_idx = 0
+        so.num_scheduled_tokens = {"req-0": 1}
+        return so
+
+    def test_drains_when_context_gone(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        runner = self._make_runner(context_present=False)
+        result = runner._run_edge_cloud_draft_last_segment(
+            self._make_so(), MagicMock()
+        )
+        assert isinstance(result, ModelRunnerOutput)
+        assert result.req_ids == ["req-0"]
+        assert result.req_id_to_index == {"req-0": 0}
+
+    def test_drains_when_task_id_none(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        runner = self._make_runner(context_present=False)
+        result = runner._run_edge_cloud_draft_last_segment(
+            self._make_so(task_id=None), MagicMock()
+        )
+        assert isinstance(result, ModelRunnerOutput)
+        assert result.req_ids == ["req-0"]

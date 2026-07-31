@@ -246,6 +246,13 @@ class PDSeparatedScheduler(Scheduler):
         self.prefill_inflight_count: int = 0
         self.decode_or_draft_inflight_limit: int = 1
         self.decode_or_draft_inflight_count: int = 0
+        # DECODE_FIRST heads picked but not yet completed (update_from_output).
+        # DRAFT_FIRST and DECODE_FIRST use different recv primitives but share
+        # the DECODE stream, so they must not be in flight simultaneously
+        # (the cloud's recv order could mismatch the edge's send order).
+        # DRAFT_FIRST+DRAFT_FIRST is safe (same primitive, FIFO), so draft
+        # pipelining only needs to gate on decode heads, not total heads.
+        self.decode_head_inflight_count: int = 0
         self.draft_remote_pending_count: int = 0
 
         # Phase6 data-plane channel manager — per-dp_rank slice.
@@ -744,11 +751,27 @@ class PDSeparatedScheduler(Scheduler):
             # strict FIFO order.  Do not wait for a DRAFT_FIRST result merely
             # to decrement draft_inflight_count; bound the amount of queued
             # work using the remote-pending credit instead.
+            # `not self._force_draft_last` enforces the DRAFT_FIRST ->
+            # DRAFT_LAST alternation invariant the same way the legacy
+            # branch does: once a DRAFT_FIRST is picked, the next draft head
+            # may not be picked until its DRAFT_LAST is picked (which clears
+            # the flag).  Without it, a DRAFT_LAST dropped/drained without
+            # clearing the flag would let a second DRAFT_FIRST through.
+            # `decode_head_inflight_count == 0` (not total inflight == 0)
+            # gates only on DECODE_FIRST heads: a DRAFT_FIRST is an edge->cloud
+            # send while a DRAFT_LAST is a cloud->edge recv, so a second
+            # DRAFT_FIRST may be dispatched while the previous DRAFT_LAST is
+            # still in flight (draft pipelining).  But DRAFT_FIRST and
+            # DECODE_FIRST use different recv primitives on the same stream,
+            # so they must never be in flight together -- hence gate on decode
+            # heads only, allowing draft+draft but not draft+decode.
             return bool(
-                self.draft_remote_pending_count
+                self.decode_head_inflight_count == 0
+                and self.draft_remote_pending_count
                 < self._draft_remote_pending_limit
                 and not self.drafts_last_ready
                 and not self._force_decode_last
+                and not self._force_draft_last
             )
 
         # Scheduled draft head/tail payloads share the DECODE channel.
@@ -1095,6 +1118,19 @@ class PDSeparatedScheduler(Scheduler):
                             self.chunk_prefill_first.append(req)
                         else:
                             self.prefill_last_pending.append(req)
+                    # KV cache exhausted: super().schedule() scheduled nothing.
+                    # _prepare_pf_running_state swapped self.running for the
+                    # prefill candidate(s), so we MUST restore self.running =
+                    # saved_running here too (the non-empty branch restores
+                    # below).  Without this restore the decode requests that
+                    # were in self.running are lost -- _can_schedule_decode_first
+                    # never sees them, KV is never freed by finished decodes, and
+                    # prefill keeps returning empty -> deadlock.  Also re-prepend
+                    # the candidates that were not exposed to super() this round.
+                    self.chunk_prefill_first = (
+                        rest_candidates + self.chunk_prefill_first
+                    )
+                    self.running = saved_running
                 else:
                     scheduler_output.batch_type = BatchType.PREFILL_FIRST
                     scheduler_output.head_token = uuid4().hex
@@ -1631,19 +1667,27 @@ class PDSeparatedScheduler(Scheduler):
                     f"{scheduler_output.batch_type}"
                 )
             self._validate_draft_tail_channel(scheduler_output)
-            if self._is_stale_draft_output(scheduler_output):
-                self.draft_remote_pending_count = max(
-                    0, self.draft_remote_pending_count - 1
-                )
+            # A DRAFT_LAST here always has its DRAFT_FIRST already dispatched
+            # to the cloud (it was self-posted in _pick_draft_first_batch when
+            # the head was picked).  The cloud does not track request
+            # lifecycle, so it will isend a response even if the owning
+            # request has since finished/aborted.  The edge MUST still execute
+            # this tail (recv) to keep the DECODE hidden channel paired --
+            # never drop it.  When the request is gone the worker drains the
+            # recv and skips the tail-segment compute (see
+            # _run_edge_cloud_draft_last_segment); we also must not spawn a
+            # verify placeholder for a dead request.
+            self._force_draft_last = False
+            self._start_decode_or_draft_first_only_window()
+            if self._draft_output_reqs_live(scheduler_output):
+                self._prepare_next_decode_first_placeholder(scheduler_output)
+            else:
                 logger.info(
-                    "[PD] drop stale DRAFT_LAST task_id=%s step=%s",
+                    "[PD] drain DRAFT_LAST task_id=%s step=%s "
+                    "(request gone; worker will drain cloud response)",
                     scheduler_output.draft_task_id,
                     scheduler_output.draft_step_idx,
                 )
-                continue
-            self._force_draft_last = False
-            self._start_decode_or_draft_first_only_window()
-            self._prepare_next_decode_first_placeholder(scheduler_output)
             return scheduler_output
         return self._make_empty_batch()
 
@@ -1770,17 +1814,31 @@ class PDSeparatedScheduler(Scheduler):
     def _is_stale_draft_output(
         self, scheduler_output: SchedulerOutput
     ) -> bool:
-        if (
-            scheduler_output.draft_task_id
-            in self._pregenerated_draft_task_ids
-            and self._draft_first_dispatched
-        ):
-            return False
+        # A draft output is stale when none of its backing requests are still
+        # active.  This drives the DRAFT_FIRST skip in _pick_draft_first_batch:
+        # once the owning request is gone, future (not-yet-dispatched) draft
+        # heads must not be picked -- the edge can no longer produce their
+        # payload (the draft context was cleared on finish/abort) and the
+        # cloud would be left waiting for data that never arrives.
+        # Already-dispatched heads are handled separately: their matching
+        # DRAFT_LAST is always executed (drained) in _pick_draft_last_batch to
+        # pair the cloud's response, so this check intentionally does NOT
+        # exempt pre-generated dispatched chains the way it used to.
+        return not self._draft_output_reqs_live(scheduler_output)
+
+    def _draft_output_reqs_live(
+        self, scheduler_output: SchedulerOutput
+    ) -> bool:
+        """True if any request backing this draft output is still active.
+
+        Used both to decide whether a DRAFT_LAST may spawn a verify
+        placeholder and (inverted) whether a DRAFT_FIRST is stale.
+        """
         req_ids = set(scheduler_output.num_scheduled_tokens)
         if scheduler_output.parent_req_id:
             req_ids.add(scheduler_output.parent_req_id)
-        return bool(req_ids) and all(
-            req_id not in self.requests for req_id in req_ids
+        return not req_ids or any(
+            req_id in self.requests for req_id in req_ids
         )
 
     def _pick_decode_last_batch(self) -> SchedulerOutput:
@@ -1868,6 +1926,7 @@ class PDSeparatedScheduler(Scheduler):
                     )
                     self._ensure_cached_all_token_ids(scheduler_output)
                     self.decode_or_draft_inflight_count += 1
+                    self.decode_head_inflight_count += 1
                     self._force_decode_last = True
                     self._start_decode_last_delay()
 
@@ -2135,6 +2194,8 @@ class PDSeparatedScheduler(Scheduler):
             # 在 D尾仍在 batch_queue 中时就被调度，消除 Cloud idle gap。
             if self.decode_or_draft_inflight_count > 0:
                 self.decode_or_draft_inflight_count -= 1
+            if self.decode_head_inflight_count > 0:
+                self.decode_head_inflight_count -= 1
             logger.info(
                 f"[PD] update_from_output DECODE_FIRST done, "
                 f"decode_or_draft_inflight: {self.decode_or_draft_inflight_count}/{self.decode_or_draft_inflight_limit}",

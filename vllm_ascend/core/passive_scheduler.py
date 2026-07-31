@@ -664,7 +664,22 @@ class PassiveScheduler:
         ):
             self._clear_prefill_middle_throttle()
             return True
-        # wangwei, 需要关注是否影响dp并行时序
+        started_at = self._prefill_middle_throttle_started_at
+        if started_at is None:
+            return True
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        limit_ms = self._prefill_middle_throttle_seconds * 1000
+        if elapsed_ms >= limit_ms:
+            logger.error(
+                f"[PD-PASSIVE] Throttle timeout: waited {elapsed_ms:.1f}ms, "
+                f"fallback to prefill",
+            )
+            self._clear_prefill_middle_throttle()
+            return True
+        logger.debug(
+            f"[PD-PASSIVE] Throttle active: {elapsed_ms:.1f}ms / {limit_ms:.0f}ms, "
+            f"still waiting for decode",
+        )
         return False
 
     def schedule(self) -> ScheduledBatch:
@@ -714,6 +729,41 @@ class PassiveScheduler:
             boundaries.append((start, start + size))
             start += size
         return boundaries
+
+    # ------------------------------------------------------------------ #
+    # Pick methods (analogous to edge-side PDSeparatedScheduler)         #
+    # ------------------------------------------------------------------ #
+    def _pick_prefill_batch(self) -> ScheduledBatch:
+        """Pick a prefill or prefill-like batch from the ready queues.
+
+        Checks in priority order: active prefill slices (continuation of
+        a previously sliced prefill), fresh prefills from ``ready_prefills``,
+        then PD-mix batches from ``ready_pdmixes``.
+
+        Caller must ensure at least one source is non-empty before calling.
+        """
+        if self._active_prefill_slices:
+            return self._build_active_prefill_slice_batch()
+        if self.ready_prefills:
+            return self._build_batch(self.ready_prefills.popleft())
+        assert self.ready_pdmixes, (
+            "_pick_prefill_batch called with no prefill work available"
+        )
+        return self._build_batch(self.ready_pdmixes.popleft())
+
+    def _pick_decode_batch(self) -> ScheduledBatch:
+        """Pick a decode batch from ``ready_decodes``.
+
+        Caller must ensure ``ready_decodes`` is non-empty before calling.
+        """
+        return self._build_batch(self.ready_decodes.popleft())
+
+    def _pick_draft_batch(self) -> ScheduledBatch:
+        """Pick a draft batch from ``ready_drafts``.
+
+        Caller must ensure ``ready_drafts`` is non-empty before calling.
+        """
+        return self._build_batch(self.ready_drafts.popleft())
 
     def _ready_prefill_is_sliced_first_block(self) -> bool:
         if not self.ready_prefills:
@@ -842,7 +892,7 @@ class PassiveScheduler:
                     CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT
                 )
                 self._start_prefill_middle_throttle()
-                return self._build_active_prefill_slice_batch()
+                return self._pick_prefill_batch()
             if self.ready_prefills:
                 if (
                     self.ready_decodes
@@ -856,14 +906,14 @@ class PassiveScheduler:
                     self.ready_prefills[0], "cloud_suggest_slicing", False
                 ):
                     self._start_prefill_middle_throttle()
-                return self._build_batch(self.ready_prefills.popleft())
+                return self._pick_prefill_batch()
             # No Prefill: callback to Draft (priority) or Decode
             if self.ready_drafts:
                 self._clear_prefill_middle_throttle()
-                return self._build_batch(self.ready_drafts.popleft())
+                return self._pick_draft_batch()
             if self.ready_decodes:
                 self._clear_prefill_middle_throttle()
-                return self._build_batch(self.ready_decodes.popleft())
+                return self._pick_decode_batch()
         else:  # EXPECT_EXECUTE_DECODE_OR_DRAFT
             # Draft priority > Decode
             if self.ready_drafts:
@@ -871,27 +921,27 @@ class PassiveScheduler:
                     CloudSchedulingState.EXPECT_EXECUTE_PREFILL
                 )
                 self._clear_prefill_middle_throttle()
-                return self._build_batch(self.ready_drafts.popleft())
+                return self._pick_draft_batch()
             if self.ready_decodes:
                 self.cloud_scheduling_state = (
                     CloudSchedulingState.EXPECT_EXECUTE_PREFILL
                 )
                 self._clear_prefill_middle_throttle()
-                return self._build_batch(self.ready_decodes.popleft())
+                return self._pick_decode_batch()
             # No Draft/Decode: callback to Prefill.  Stay in the current
             # state — the next schedule() call will check for drafts
             # again at its earliest opportunity.
             if self._can_fallback_to_prefill_in_decode_state():
                 if self._active_prefill_slices:
                     self._start_prefill_middle_throttle()
-                    return self._build_active_prefill_slice_batch()
+                    return self._pick_prefill_batch()
                 if self.ready_prefills:
                     if getattr(
                         self.ready_prefills[0],
                         "cloud_suggest_slicing", False
                     ):
                         self._start_prefill_middle_throttle()
-                    return self._build_batch(self.ready_prefills.popleft())
+                    return self._pick_prefill_batch()
             else:
                 return ScheduledBatch.empty()
 
@@ -903,7 +953,7 @@ class PassiveScheduler:
                 return ScheduledBatch.empty()
             if state == CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT:
                 self._start_prefill_middle_throttle()
-            return self._build_batch(self.ready_pdmixes.popleft())
+            return self._pick_prefill_batch()
         return ScheduledBatch.empty()
 
     def _schedule_expect_alternation_coordinated(self) -> ScheduledBatch:
@@ -1378,9 +1428,26 @@ class PassiveScheduler:
     def _schedule_from_queue(self, queue_name: str) -> ScheduledBatch:
         if self._active_prefill_slices:
             if queue_name == "ready_decodes" and self.ready_decodes:
-                return self._build_batch(self.ready_decodes.popleft())
+                return self._pick_decode_batch()
             if queue_name in ("ready_prefills", "ready_pdmixes"):
-                return self._build_active_prefill_slice_batch()
+                return self._pick_prefill_batch()
+            return ScheduledBatch.empty()
+
+        if queue_name == "ready_prefills":
+            if self.ready_prefills:
+                return self._build_batch(self.ready_prefills.popleft())
+            return ScheduledBatch.empty()
+        if queue_name == "ready_decodes":
+            if self.ready_decodes:
+                return self._pick_decode_batch()
+            return ScheduledBatch.empty()
+        if queue_name == "ready_drafts":
+            if self.ready_drafts:
+                return self._pick_draft_batch()
+            return ScheduledBatch.empty()
+        if queue_name == "ready_pdmixes":
+            if self.ready_pdmixes:
+                return self._pick_prefill_batch()
             return ScheduledBatch.empty()
 
         q: deque[SchedulerOutput] = getattr(self, queue_name)

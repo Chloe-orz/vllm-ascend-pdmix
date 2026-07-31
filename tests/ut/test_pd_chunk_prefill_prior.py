@@ -1032,3 +1032,82 @@ class TestRequestCounts:
         ):
             total = scheduler.get_num_unfinished_requests()
             assert total == 10 + 0 + 0 + 1  # base + chunk + pending + tails
+
+
+# ------------------------------------------------------------------ #
+# Test: empty PREFILL_FIRST restores self.running (KV-exhaustion)    #
+# ------------------------------------------------------------------ #
+
+
+class TestPickPrefillFirstEmptyRestoresRunning:
+    """Regression for the KV-exhaustion deadlock.
+
+    When ``super().schedule()`` returns an empty batch (KV cache exhausted by
+    running decode requests), ``_pick_prefill_first_batch`` must restore
+    ``self.running = saved_running``.  ``_prepare_pf_running_state`` swaps
+    ``self.running`` for the prefill candidate(s) before calling
+    ``super().schedule()``; the non-empty branch always restored it, but the
+    empty branch did not.  Without the restore, the decode requests that were
+    in ``self.running`` are lost -- ``_can_schedule_decode_first()`` never sees
+    them, KV is never freed by finished decodes, and prefill keeps returning
+    empty -> deadlock (with the cloud eventually evicting unconsumed draft
+    metadata as a downstream symptom).
+    """
+
+    def _make(self):
+        from vllm_ascend.core.pd_separated_scheduler import PDSeparatedScheduler
+
+        s = PDSeparatedScheduler.__new__(PDSeparatedScheduler)
+        decode_req = _make_mock_request(request_id="dec-0", is_prefill_chunk=False)
+        s.running = [decode_req]
+        s.chunk_prefill_first = []
+        s.max_num_running_reqs = 256
+        s.limit_prefill_batch_size = False
+        s.chunk_prefill_prior_enable = True
+        s.next_prefill_prior_enable = False
+        s._pending_tail_count = {}
+        s.prefill_last_pending = []
+        s._ahead_chunk_count = {}
+        s._prefill_flight_by_token = {}
+        s.hidden_channel_manager = MagicMock()
+        s.waiting = []
+        return s, decode_req
+
+    def test_empty_prefill_first_restores_running(self):
+        from vllm.v1.core.sched.output import SchedulerOutput
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        s, decode_req = self._make()
+        empty_so = SchedulerOutput.make_empty()
+
+        with patch.object(Scheduler, "schedule", return_value=empty_so):
+            result = s._pick_prefill_first_batch()
+
+        assert result.total_num_scheduled_tokens == 0
+        # The decode request must survive the empty prefill attempt -- this is
+        # the invariant whose absence caused the deadlock.
+        assert s.running == [decode_req]
+        assert s.max_num_running_reqs == 256
+        assert s.chunk_prefill_first == []
+
+    def test_empty_prefill_first_returns_mid_prefill_candidate(self):
+        """A mid-prefill candidate exposed to super() but not scheduled (KV
+        exhausted) must go back to chunk_prefill_first, and self.running must
+        still be restored to the saved decode requests."""
+        from vllm.v1.core.sched.output import SchedulerOutput
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        s, decode_req = self._make()
+        mid_prefill = _make_mock_request(request_id="pf-0", is_prefill_chunk=True)
+        s.chunk_prefill_first = [mid_prefill]
+        # Fresh candidate (no in-flight tail) -> _prepare exposes it.
+        s._pending_tail_count = {"pf-0": 0}
+
+        empty_so = SchedulerOutput.make_empty()
+        with patch.object(Scheduler, "schedule", return_value=empty_so):
+            result = s._pick_prefill_first_batch()
+
+        assert result.total_num_scheduled_tokens == 0
+        # Decode requests restored, mid-prefill candidate back in chunk_prefill.
+        assert decode_req in s.running
+        assert mid_prefill in s.chunk_prefill_first
