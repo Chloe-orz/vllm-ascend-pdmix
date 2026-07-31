@@ -866,8 +866,14 @@ class NPUModelRunner(GPUModelRunner):
         # small a bound evicts an in-flight task's metadata; the matching
         # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
         # cloud never sends the DRAFT_LAST response, deadlocking the edge's
-        # matching recv on the shared DECODE channel.
-        self._cloud_spec_decode_metadata_cache_max: int = 32
+        # matching recv on the shared DECODE channel.  Raised from 32 to 128:
+        # the kv-cache page rebase raises cloud-side concurrency, so the
+        # number of in-flight verifies (each caches one entry here until its
+        # draft chain's last step pops it) can exceed 32 under high
+        # concurrency + MTP.  Paired with
+        # _purge_cloud_draft_metadata_for_finished_reqs() so the bound holds
+        # only LIVE in-flight tasks, not orphaned aborted-draft entries.
+        self._cloud_spec_decode_metadata_cache_max: int = 128
         # Same per-task treatment for the verify step's scheduler_output:
         # the independently scheduled draft task applies the
         # num_accepted / mamba state correction, and by then
@@ -3509,6 +3515,38 @@ class NPUModelRunner(GPUModelRunner):
             )
         # --- End layer slice fast path ---
 
+        # [EDGE-SEGMENT-E LEAK FIX] Always consume this forward's segment_a
+        # cache entry on segment_e entry, regardless of which path segment_e
+        # takes below (fast-path, normal-path, or stale-tail discard).
+        #
+        # Before this, the entry was only popped on the fast path. When high
+        # concurrency interleaving (2P1D) made the fast-path req_ids check
+        # fail, segment_e fell through to the normal path WITHOUT popping ->
+        # the entry orphaned. Orphans steadily filled the bounded cache,
+        # forced eviction of LIVE entries, and their later segment_e
+        # cache-missed onto the (incorrect-for-tail) normal path ->
+        # _prepare_inputs recomputed against a modified input_batch ->
+        # wrong draft token ids -> acceptance cliff. Aborted/finished reqs
+        # (popped from self.requests during the head->tail window) hit the
+        # stale-tail early-return below, which also bypassed the pop.
+        #
+        # Popping once here covers every segment_e path. It is always safe:
+        # a head_token's segment_e runs at most once, and segment_a caches
+        # under the same head_token it will later pop. If the fast path
+        # cannot reuse the entry (req_ids mismatch / empty batch), the entry
+        # is discarded rather than leaked -- the normal path recomputes, as
+        # it did before, but the cache no longer fills.
+        _edge_cache_entry: dict[str, Any] | None = None
+        if (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "edge"
+            and intermediate_tensors is not None
+            and scheduler_output.head_token is not None
+        ):
+            _edge_cache_entry = self._edge_prepare_cache_by_token.pop(
+                scheduler_output.head_token, None
+            )
+
         # Edge-cloud tail-segment validation: use the control-plane
         # head_token to resume the suspended HeadState. The scheduler and
         # hidden channel selection guarantee data-plane alignment.
@@ -3653,7 +3691,7 @@ class NPUModelRunner(GPUModelRunner):
             self._edge_cloud_enabled
             and self.edge_cloud_cfg.role == "edge"
             and intermediate_tensors is not None
-            and scheduler_output.head_token in self._edge_prepare_cache_by_token
+            and _edge_cache_entry is not None
             and _tail_head_token is not None
             and _tail_head_token in self._edge_prepare_cache
             and self.input_batch.num_reqs > 0
@@ -3679,8 +3717,6 @@ class NPUModelRunner(GPUModelRunner):
             and self._cloud_prepare_cache is not None
         )
         if _fast_path:
-            # Pop this head_token's cache so a later segment_a (different
-            # head_token) does not hand the wrong attn_metadata to this PL.
             # `cache` must be the frozen _edge_prepare_cache_by_token entry:
             # only it stores the cloned `positions` snapshot restored below
             # (see `positions = cache["positions"]`), since _preprocess reads
@@ -3689,11 +3725,13 @@ class NPUModelRunner(GPUModelRunner):
             # popped for cleanup only - it holds no positions and is not
             # frozen, so it must not become `cache`.
             self._edge_prepare_cache.pop(_tail_head_token, None)
-            cache = self._edge_prepare_cache_by_token.pop(
-                scheduler_output.head_token
-            )
             # consumed: only this head_token's entry is removed; other
             # in-flight prefills' caches are preserved for 2P1D.
+            # Entry already popped at segment_e entry (covers fast/normal/
+            # stale-tail paths uniformly, preventing orphan leaks). Reuse it
+            # so a later segment_a (different head_token) does not hand the
+            # wrong attn_metadata to this PL.
+            cache = _edge_cache_entry
             total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
             num_tokens_padded = cache["num_tokens_padded"]
             num_tokens_across_dp = cache["num_tokens_across_dp"]
@@ -3755,6 +3793,20 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 if not _fast_path and not _cloud_fast_path:
+                    # [EDGE-SEGMENT-E LEAK FIX] If we popped a segment_a entry
+                    # but cannot take the fast path (req_ids mismatch from
+                    # interleaving, or empty batch), the entry is discarded
+                    # here instead of orphaning. Log so the residual leak
+                    # rate can be confirmed on NPU (should be ~0 accumulation;
+                    # non-zero count = the normal-path corruption cases that
+                    # fix C would address).
+                    if _edge_cache_entry is not None:
+                        logger.debug(
+                            "[EDGE-SEGMENT-E] head_token=%s segment_a cache "
+                            "popped but fast-path skipped; entry discarded "
+                            "(previously this orphaned and leaked).",
+                            scheduler_output.head_token,
+                        )
                     # Fix up prev_req_id_to_index for requests that were discarded
                     # in the previous sample_tokens step. If a request has
                     # prev_num_draft_len > 0 but is missing from
@@ -4702,6 +4754,41 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
+    def _purge_cloud_draft_metadata_for_finished_reqs(self) -> None:
+        """Drop cloud draft-metadata entries whose requests have ALL
+        finished/aborted (left self.requests).
+
+        Such entries' draft will never run to consume them (the last-step
+        pop at DRAFT_LAST never fires), so keeping them orphans the bounded
+        _cloud_spec_decode_metadata_by_task cache and forces eviction of
+        LIVE entries -> RuntimeError in _resolve_cloud_spec_decode_metadata
+        / _reconstruct_cloud_draft_positions + edge recv deadlock.
+
+        This only removes entries whose draft cannot run (all reqs gone),
+        never a live in-flight task.  Called on each cache add so abort
+        leaks (draft chains dropped mid-way under high concurrency) are
+        reclaimed promptly instead of accumulating to the bound.
+        """
+        task_cache = self._cloud_spec_decode_metadata_by_task
+        if not task_cache:
+            return
+        scheduler_by_task = self._cloud_scheduler_output_by_task
+        # A task's req_ids live on the frozen verify scheduler_output.
+        # If none of them are still active, the draft will never consume
+        # this entry -- safe to drop.
+        finished_task_ids = [
+            task_id
+            for task_id, so in scheduler_by_task.items()
+            if not (
+                set(so.num_scheduled_tokens.keys()) & self.requests.keys()
+            )
+        ]
+        for task_id in finished_task_ids:
+            task_cache.pop(task_id, None)
+            scheduler_by_task.pop(task_id, None)
+            self._cloud_draft_position_state_by_task.pop(task_id, None)
+            self._eagle3_cloud_aux_hidden_states_by_task.pop(task_id, None)
+
     def _cache_cloud_spec_decode_metadata(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4729,6 +4816,11 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "Cannot cache cloud draft metadata without target head_token"
             )
+        # Proactively reclaim entries whose requests have all finished/aborted
+        # (aborted draft chains never reach the last-step pop). Runs before the
+        # bound-eviction so the bound only holds LIVE in-flight tasks, avoiding
+        # evicting an in-flight task's metadata (which would raise + deadlock).
+        self._purge_cloud_draft_metadata_for_finished_reqs()
         task_cache = self._cloud_spec_decode_metadata_by_task
         if (
             task_id not in task_cache
