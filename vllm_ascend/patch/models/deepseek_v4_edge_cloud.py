@@ -111,7 +111,7 @@ def _forward_edge_cloud_segment_v4(
         ``hidden_states`` for the last segment.
     """
     num_layers = len(self.layers)
-    assert 0 <= start_layer <= end_layer <= num_layers, (
+    assert 0 <= start_layer < end_layer <= num_layers, (
         f"Invalid segment range: [{start_layer}, {end_layer}) "
         f"for {num_layers} layers"
     )
@@ -165,10 +165,6 @@ def _forward_edge_cloud_segment_v4(
     if not is_last_segment:
         # residual keeps its original (n, hc_mult, h) shape, aligned with
         # standard forward path and make_empty_intermediate_tensors buffer.
-        if residual is None:
-            # embedding_only has a zero-layer segment A. Keep the wire
-            # payload tensor-only and aligned with the regular layer output.
-            residual = torch.zeros_like(hidden_states)
         return IntermediateTensors({
             "hidden_states": hidden_states,
             "residual": residual,
