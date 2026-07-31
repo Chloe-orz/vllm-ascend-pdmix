@@ -578,8 +578,17 @@ class NPUModelRunner(GPUModelRunner):
             outer_model_type = getattr(
                 getattr(self.model_config, "hf_config", None), "model_type", ""
             )
-            self._is_deepseek_v4 = (
-                    model_type == "deepseek_v4" or hasattr(hf_config, "hc_mult")
+            self._is_deepseek_v4 = model_type == "deepseek_v4"
+            if self._is_deepseek_v4 and (
+                self.edge_cloud_cfg.mode != "head_tail"
+                or (self.head_k, self.tail_k) != (3, 1)
+            ):
+                raise ValueError(
+                    "DeepSeek-V4 edge-cloud mode only supports the original "
+                    "head-3/tail-1 layout because the first three Hash MoE "
+                    "layers must stay on the edge. Set "
+                    "edge_cloud_config.mode='head_tail' and "
+                    "edge_cloud_config.edge_head_tail_layers=[3, 1]."
                 )
             self._is_qwen3_5 = "qwen3_5" in model_type
             self._is_deepseek_v2 = "deepseek" in model_type
@@ -905,8 +914,17 @@ class NPUModelRunner(GPUModelRunner):
             outer_model_type = getattr(
                 getattr(self.model_config, "hf_config", None), "model_type", ""
             )
-            self._is_deepseek_v4 = (
-                    model_type == "deepseek_v4" or hasattr(hf_config, "hc_mult")
+            self._is_deepseek_v4 = model_type == "deepseek_v4"
+            if self._is_deepseek_v4 and (
+                self.edge_cloud_cfg.mode != "head_tail"
+                or (self.head_k, self.tail_k) != (3, 1)
+            ):
+                raise ValueError(
+                    "DeepSeek-V4 edge-cloud mode only supports the original "
+                    "head-3/tail-1 layout because the first three Hash MoE "
+                    "layers must stay on the edge. Set "
+                    "edge_cloud_config.mode='head_tail' and "
+                    "edge_cloud_config.edge_head_tail_layers=[3, 1]."
                 )
             self._is_qwen3_5 = "qwen3_5" in model_type
             self._is_deepseek_v2 = "deepseek" in model_type
