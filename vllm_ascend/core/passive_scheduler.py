@@ -575,10 +575,13 @@ class PassiveScheduler:
             )
             self._clear_prefill_middle_throttle()
             return True
-        logger.info(
-            f"[PD-PASSIVE] Throttle active: {elapsed_ms:.1f}ms / {limit_ms:.0f}ms, "
-            f"still waiting for decode",
-        )
+        # Avoid logging every scheduler poll while waiting for decode. The
+        # passive scheduling loop runs roughly once per millisecond, so this
+        # message otherwise floods the logs during each throttle window.
+        # logger.info(
+        #     f"[PD-PASSIVE] Throttle active: {elapsed_ms:.1f}ms / "
+        #     f"{limit_ms:.0f}ms, still waiting for decode",
+        # )
         return False
 
     def schedule(self) -> ScheduledBatch:
