@@ -1791,25 +1791,34 @@ class PDSeparatedScheduler(Scheduler):
             )
         ):
             self._decode_first_placeholder_parent = None
-        kept_last: deque[SchedulerOutput] = deque()
-        dropped_last = 0
+        # Never drop a queued DRAFT_LAST.  Tails are self-posted in
+        # _pick_draft_first_batch at the moment their head is picked, and
+        # a picked DRAFT_FIRST is always dispatched to the cloud.  The
+        # cloud does not track request lifecycle, so it will still isend
+        # the response; the edge MUST execute (drain) the tail to keep
+        # the DECODE hidden channel paired (see _pick_draft_last_batch
+        # and the drain path in the worker's
+        # _run_edge_cloud_draft_last_segment).  Dropping the tail also
+        # strands _force_draft_last=True -- the flag is only cleared when
+        # a DRAFT_LAST is picked -- which then blocks every future
+        # DRAFT_FIRST/DECODE_FIRST and deadlocks the scheduler.
         for output in self.drafts_last_ready:
             if self._scheduler_output_intersects_req_ids(output, req_ids):
-                task_id = output.draft_task_id
-                if task_id in self._pregenerated_draft_task_ids:
-                    chain_reqs = self._pregenerated_draft_req_ids.get(
-                        task_id, set()
-                    )
-                    if self._draft_first_dispatched or chain_reqs - req_ids:
-                        kept_last.append(output)
-                        continue
-                dropped_last += 1
-            else:
-                kept_last.append(output)
-        self.drafts_last_ready = kept_last
-        self.draft_remote_pending_count = max(
-            0, self.draft_remote_pending_count - dropped_last
-        )
+                gone = {
+                    rid
+                    for rid in output.num_scheduled_tokens
+                    if rid in req_ids
+                }
+                if output.parent_req_id in req_ids:
+                    gone.add(output.parent_req_id)
+                logger.info(
+                    "[PD] keep DRAFT_LAST task_id=%s step=%s for drain "
+                    "(%d member request(s) gone; its DRAFT_FIRST was "
+                    "already dispatched to the cloud)",
+                    output.draft_task_id,
+                    output.draft_step_idx,
+                    len(gone),
+                )
 
     def _is_stale_draft_output(
         self, scheduler_output: SchedulerOutput
