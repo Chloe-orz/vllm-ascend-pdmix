@@ -585,7 +585,7 @@ class PassiveScheduler:
         # 1. 已有 decode 到达 Cloud → 强制切层（确定性收益）
         if self.ready_decodes:
             if getattr(self, "_step", None):
-                logger.debug(
+                logger.info(
                     "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice (ready_decodes=%d)",
                     self._step, so.batch_type.value if so.batch_type else "?",
                     len(self.ready_decodes),
@@ -601,7 +601,7 @@ class PassiveScheduler:
         )
         if _cloud_suggest:
             if getattr(self, "_step", None):
-                logger.debug(
+                logger.info(
                     "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice (cloud_suggest=%s)",
                     self._step, so.batch_type.value if so.batch_type else "?",
                     _cloud_suggest,
@@ -611,7 +611,7 @@ class PassiveScheduler:
         # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
         if getattr(self, "_step", None):
-            logger.debug(
+            logger.info(
                 "[COORD-DIAG] _slice_for step=%d bt=%s → no-slice (no decode, no suggest)",
                 self._step, so.batch_type.value if so.batch_type else "?",
             )
@@ -943,10 +943,10 @@ class PassiveScheduler:
         pdmix_items = [_pf_str(so) for so in self.ready_pdmixes]
         as_items = [_si_str(t) for t in self._active_prefill_slices]
         logger.error(
-            "[COORD-DIAG] DP%s %s state=%s "
+            "[COORD-DIAG] step=%d DP%s %s state=%s "
             "pf[%d]=[%s] dec[%d]=[%s] pdmix[%d]=[%s] "
             "active_slices[%d]=[%s]",
-            _dp_rank, tag, self.cloud_scheduling_state.name,
+            self._step, _dp_rank, tag, self.cloud_scheduling_state.name,
             len(self.ready_prefills), ", ".join(pf_items),
             len(self.ready_decodes), ", ".join(dec_items),
             len(self.ready_pdmixes), ", ".join(pdmix_items),
@@ -960,9 +960,9 @@ class PassiveScheduler:
             self.vllm_config.parallel_config, "data_parallel_rank", 0
         )
         logger.error(
-            "[COORD-DIAG] DP%s %s bt=%s cont=%s tok=%s "
+            "[COORD-DIAG] step=%d DP%s %s bt=%s cont=%s tok=%s "
             "new_state=%s throttle=%s queue=%s slice=%s",
-            _dp_rank, tag,
+            self._step, _dp_rank, tag,
             decision.batch_type.value if decision.batch_type else "EMPTY",
             decision.is_continuation,
             decision.token_count,
