@@ -747,10 +747,11 @@ class PassiveEngineCoreProc:
             )
             bt = batch.scheduler_output.batch_type.value
             _tok = batch.scheduler_output.total_num_scheduled_tokens
+            _seq = self.passive_scheduler._arrival_seq(batch.scheduler_output)
             logger.info(
                 "[CLOUD-MQ] About to enqueue batch_type=%s "
-                "total_num_scheduled_tokens=%s",
-                bt, _tok,
+                "total_num_scheduled_tokens=%s seq=%s",
+                bt, _tok, _seq,
             )
             _t0 = time.monotonic()
             self.executor.rpc_broadcast_mq.enqueue(
