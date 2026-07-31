@@ -659,29 +659,17 @@ def _patched_step_with_batch_queue(self):
     # gate the one-time log purely on the flag (+ _dp_parallel_logged).
     _dp_parallel = getattr(self, "_dp_parallel", None)
     if _dp_parallel is None:
-        _dp_parallel = getattr(
+        # DP-parallel is configured only when data_parallel_size > 1. For DP=1
+        # leave _dp_parallel as None (do NOT cache the `> 1` bool) so the
+        # `if _dp_parallel is None:` branch below -- the simple, draft-guarded
+        # path that yields correct MTP output -- is taken. Caching a bool here
+        # makes `is None` always False and dead-codes that branch (878918df
+        # regression: MTP draft race -> 不说人话).
+        if getattr(
             self.vllm_config.parallel_config, "data_parallel_size", 1
-        ) > 1
-        self._dp_parallel = _dp_parallel
-
-    # [RC-DIAG] one-time confirmation of which scheduling path is live.
-    # root-cause A: `if _dp_parallel is None:` (below) is dead code because
-    #   _dp_parallel is a bool (never None) -> the guarded original path that
-    #   checked _has_unresolved_edge_cloud_draft_parent() is never taken.
-    # root-cause B: drafts missing from coordinated scheduling -> only when
-    #   _coordinated=True (MoE + DP>1). For dense / DP=1 it is dormant.
-    if not getattr(self, "_rc_diag_logged", False):
-        self._rc_diag_logged = True
-        _rc_coordinated = self._is_coordinated_dp()
-        vllm_logger.error(
-            "[RC-DIAG] _dp_parallel=%r(type=%s) is_none_check=%s "
-            "(False=>guard-branch-SKIPPED=>root-cause-A) | "
-            "coordinated=%s (root-cause-B %s) | "
-            "uses_scheduled_draft=%s",
-            _dp_parallel, type(_dp_parallel).__name__, _dp_parallel is None,
-            _rc_coordinated, "ACTIVE" if _rc_coordinated else "dormant",
-            self._uses_scheduled_edge_cloud_draft(),
-        )
+        ) > 1:
+            _dp_parallel = True
+            self._dp_parallel = _dp_parallel
 
     model_executed = False
     deferred_scheduler_output = None
@@ -853,32 +841,11 @@ def _patched_step_with_batch_queue(self):
             or ((not _coordinated) and self.scheduler.has_requests())
         )
         if _should_schedule:
-            # [RC-DIAG-A] root-cause A smoking gun: at b4987371 the
-            # _has_unresolved_edge_cloud_draft_parent() guard BLOCKED scheduling
-            # while a draft-parent tail (DECODE_LAST / last PREFILL_LAST) was
-            # still in flight. The `if _dp_parallel is None:` dead code (878918df)
-            # skips that guard, so MTP draft creation races the next step -> garbage.
-            _rc_guard = self._has_unresolved_edge_cloud_draft_parent()
             if _coordinated:
                 scheduler_output = self.scheduler._schedule_target(_coord_winner)
             else:
                 scheduler_output = self.scheduler.schedule()
             self._hang_last_bt = str(scheduler_output.batch_type)
-            vllm_logger.error(
-                "[RC-DIAG-SCHED] scheduled bt=%s tokens=%s via %s",
-                scheduler_output.batch_type,
-                scheduler_output.total_num_scheduled_tokens,
-                "_schedule_target" if _coordinated else "schedule()",
-            )
-            if _rc_guard:
-                vllm_logger.error(
-                    "[RC-DIAG-A] SMOKING GUN: scheduled bt=%s tokens=%s via %s "
-                    "while draft_parent_unresolved=True (guard SKIPPED -> "
-                    "root cause A)",
-                    scheduler_output.batch_type,
-                    scheduler_output.total_num_scheduled_tokens,
-                    "_schedule_target" if _coordinated else "schedule()",
-                )
 
             # [ascend insert] Assign head-token for edge-cloud head-segment
             # batches so the tail-segment can be matched to the suspended
