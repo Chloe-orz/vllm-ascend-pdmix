@@ -572,19 +572,47 @@ class PassiveScheduler:
             BatchType.DECODE_FIRST,
             BatchType.DRAFT_FIRST,
         ):
+            if getattr(self, "_step", None):
+                logger.debug(
+                    "[COORD-DIAG] _slice_for step=%d bt=%s → no-slice (decode/draft type)",
+                    self._step, so.batch_type.value if so.batch_type else "?",
+                )
             return [None]
 
         # [方案B] Cloud 侧决策：
         # 1. 已有 decode 到达 Cloud → 强制切层（确定性收益）
         if self.ready_decodes:
-            return self._do_slice(so, token_count)
+            if getattr(self, "_step", None):
+                logger.debug(
+                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice (ready_decodes=%d)",
+                    self._step, so.batch_type.value if so.batch_type else "?",
+                    len(self.ready_decodes),
+                )
+            return self._do_slice(so, decision)
 
         # 2. Edge 建议切层（decode 正在路上）→ 切层
-        if getattr(so, "cloud_suggest_slicing", False):
-            return self._do_slice(so, token_count)
+        #    decision.cloud_suggest_slicing 优先，为 None 时回退到 so.cloud_suggest_slicing
+        _cloud_suggest = (
+            decision.cloud_suggest_slicing
+            if decision and decision.cloud_suggest_slicing is not None
+            else getattr(so, "cloud_suggest_slicing", False)
+        )
+        if _cloud_suggest:
+            if getattr(self, "_step", None):
+                logger.debug(
+                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice (cloud_suggest=%s)",
+                    self._step, so.batch_type.value if so.batch_type else "?",
+                    _cloud_suggest,
+                )
+            return self._do_slice(so, decision)
 
         # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
+        if getattr(self, "_step", None):
+            logger.debug(
+                "[COORD-DIAG] _slice_for step=%d bt=%s → no-slice (no decode, no suggest)",
+                self._step, so.batch_type.value if so.batch_type else "?",
+            )
         return [None]
 
     # ------------------------------------------------------------------ #
@@ -883,6 +911,8 @@ class PassiveScheduler:
             self._log_queue_state("post-local-decision")
             self._log_local_decision(decision, "post-local-decision")
         decision = self._coordinate_decision(decision)
+        if decision.cloud_suggest_slicing is None:
+            decision.cloud_suggest_slicing = False
         if decision.batch_type is not None:
             self._log_local_decision(decision, "post-coord-decision")
         if decision.batch_type is None:
