@@ -872,6 +872,13 @@ class NPUWorker(WorkerBase):
             if draft_step_idx == 0
             else len(scheduler_output.num_scheduled_tokens)
         )
+        draft_model = getattr(drafter, "model", None)
+        get_hc_mult = getattr(
+            draft_model,
+            "get_edge_cloud_draft_hc_mult",
+            None,
+        )
+        hc_mult = int(get_hc_mult()) if callable(get_hc_mult) else 1
         return build_scheduled_draft_tensor_meta(
             method=speculative_config.method,
             direction=direction,
@@ -879,6 +886,7 @@ class NPUWorker(WorkerBase):
             num_tokens=num_tokens,
             hidden_size=drafter.hidden_size,
             dtype=self.model_runner.dtype,
+            hc_mult=hc_mult,
         )
 
     def _execute_model_edge_head(

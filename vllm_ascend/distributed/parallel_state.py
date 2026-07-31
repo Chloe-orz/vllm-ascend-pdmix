@@ -193,21 +193,29 @@ def build_scheduled_draft_tensor_meta(
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
+    hc_mult: int = 1,
     device: str = "npu",
 ) -> ScheduledDraftTensorMeta | None:
     """Build a metadata-free scheduled draft wire schema.
 
     Returns ``None`` for an unknown method/direction so callers can retain the
-    dynamic tensor-dict transport as a compatibility fallback.
+    dynamic tensor-dict transport as a compatibility fallback. ``hc_mult``
+    keeps the default Qwen/Eagle payload 2D while allowing DeepSeek-V4 MTP to
+    derive its 3D HC payload on both peers.
     """
     if direction not in ("e2c", "c2e"):
         return None
 
-    tensor_meta = TensorMetadata(
-        device,
-        dtype,
-        (num_tokens, hidden_size),
+    if hc_mult <= 0:
+        raise ValueError(
+            f"Scheduled draft hc_mult must be positive, got {hc_mult}"
+        )
+    tensor_shape = (
+        (num_tokens, hidden_size)
+        if hc_mult == 1
+        else (num_tokens, hc_mult, hidden_size)
     )
+    tensor_meta = TensorMetadata(device, dtype, tensor_shape)
     if method in ("mtp", "qwen_mtp", "qwen3_5_mtp"):
         return ScheduledDraftTensorMeta(
             metadata_list=(("hidden_states", tensor_meta),),

@@ -230,17 +230,16 @@ def _deepseek_v4_mtp_predictor_forward_edge_cloud_segment(
         raise RuntimeError(
             "DeepSeek-V4 MTP segment C cannot execute a missing mtp_block"
         )
-    hidden_states, residual = layer.mtp_block(
+    hidden_states, _ = layer.mtp_block(
         positions=positions,
         hidden_states=hidden_states,
         residual=None,
     )
-    return IntermediateTensors(
-        {
-            "hidden_states": hidden_states,
-            "residual": residual,
-        }
-    )
+    # Match the stock DeepSeek-V4 MTP forward: hc_head consumes the decoder
+    # hidden states directly, so the residual does not need to cross back to
+    # the edge. This also keeps the scheduled-MTP wire contract aligned with
+    # Qwen-MTP (one hidden_states tensor in each direction).
+    return IntermediateTensors({"hidden_states": hidden_states})
 
 
 def _deepseek_v4_mtp_forward_edge_cloud_segment(
@@ -307,6 +306,12 @@ def _deepseek_v4_mtp_model_make_empty_intermediate_tensors(
         dtype,
         device,
     )
+
+
+def _deepseek_v4_mtp_get_edge_cloud_draft_hc_mult(
+    self: DeepSeekV4MTP,
+) -> int:
+    return int(_get_mtp_layer(self.model, 0).hc_mult)
 
 
 def _replace_module_with_missing(
@@ -443,6 +448,9 @@ DeepSeekV4MTP.forward_edge_cloud_segment = (
 )
 DeepSeekV4MTP.make_empty_intermediate_tensors = (
     _deepseek_v4_mtp_model_make_empty_intermediate_tensors
+)
+DeepSeekV4MTP.get_edge_cloud_draft_hc_mult = (
+    _deepseek_v4_mtp_get_edge_cloud_draft_hc_mult
 )
 DeepSeekMultiTokenPredictorLayer.__init__ = (
     _deepseek_v4_mtp_layer_init_edge_cloud
