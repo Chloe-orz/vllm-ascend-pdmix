@@ -896,14 +896,8 @@ class NPUModelRunner(GPUModelRunner):
         # small a bound evicts an in-flight task's metadata; the matching
         # DRAFT_FIRST then raises in _reconstruct_cloud_draft_positions and the
         # cloud never sends the DRAFT_LAST response, deadlocking the edge's
-        # matching recv on the shared DECODE channel.  Raised from 32 to 128:
-        # the kv-cache page rebase raises cloud-side concurrency, so the
-        # number of in-flight verifies (each caches one entry here until its
-        # draft chain's last step pops it) can exceed 32 under high
-        # concurrency + MTP.  Paired with
-        # _purge_cloud_draft_metadata_for_finished_reqs() so the bound holds
-        # only LIVE in-flight tasks, not orphaned aborted-draft entries.
-        self._cloud_spec_decode_metadata_cache_max: int = 128
+        # matching recv on the shared DECODE channel.
+        self._cloud_spec_decode_metadata_cache_max: int = 100000
         # Same per-task treatment for the verify step's scheduler_output:
         # the independently scheduled draft task applies the
         # num_accepted / mamba state correction, and by then
@@ -4912,41 +4906,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
-    def _purge_cloud_draft_metadata_for_finished_reqs(self) -> None:
-        """Drop cloud draft-metadata entries whose requests have ALL
-        finished/aborted (left self.requests).
-
-        Such entries' draft will never run to consume them (the last-step
-        pop at DRAFT_LAST never fires), so keeping them orphans the bounded
-        _cloud_spec_decode_metadata_by_task cache and forces eviction of
-        LIVE entries -> RuntimeError in _resolve_cloud_spec_decode_metadata
-        / _reconstruct_cloud_draft_positions + edge recv deadlock.
-
-        This only removes entries whose draft cannot run (all reqs gone),
-        never a live in-flight task.  Called on each cache add so abort
-        leaks (draft chains dropped mid-way under high concurrency) are
-        reclaimed promptly instead of accumulating to the bound.
-        """
-        task_cache = self._cloud_spec_decode_metadata_by_task
-        if not task_cache:
-            return
-        scheduler_by_task = self._cloud_scheduler_output_by_task
-        # A task's req_ids live on the frozen verify scheduler_output.
-        # If none of them are still active, the draft will never consume
-        # this entry -- safe to drop.
-        finished_task_ids = [
-            task_id
-            for task_id, so in scheduler_by_task.items()
-            if not (
-                set(so.num_scheduled_tokens.keys()) & self.requests.keys()
-            )
-        ]
-        for task_id in finished_task_ids:
-            task_cache.pop(task_id, None)
-            scheduler_by_task.pop(task_id, None)
-            self._cloud_draft_position_state_by_task.pop(task_id, None)
-            self._eagle3_cloud_aux_hidden_states_by_task.pop(task_id, None)
-
     def _cache_cloud_spec_decode_metadata(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4974,11 +4933,6 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "Cannot cache cloud draft metadata without target head_token"
             )
-        # Proactively reclaim entries whose requests have all finished/aborted
-        # (aborted draft chains never reach the last-step pop). Runs before the
-        # bound-eviction so the bound only holds LIVE in-flight tasks, avoiding
-        # evicting an in-flight task's metadata (which would raise + deadlock).
-        self._purge_cloud_draft_metadata_for_finished_reqs()
         task_cache = self._cloud_spec_decode_metadata_by_task
         if (
             task_id not in task_cache
