@@ -390,7 +390,6 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
     """Complete an EMPTY SchedulerOutput without broadcasting to workers."""
     self._stash_empty_worker_cleanup(scheduler_output)
     self._process_aborts_queue()
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
@@ -439,11 +438,12 @@ def _advance_edge_cloud_draft(
         return
 
     batch_type = completed_scheduler_output.batch_type
-    is_target_tail = batch_type == BatchType.DECODE_LAST or (
-        batch_type == BatchType.PREFILL_LAST
-        and getattr(
-            completed_scheduler_output, "is_last_prefill_chunk", True
-        )
+    # Every prefill chunk must run the drafter to populate the MTP KV cache.
+    # Mid-chunk sampled/draft tokens are discarded by the worker, but their
+    # independently scheduled draft chain still needs to be finalized here.
+    is_target_tail = batch_type in (
+        BatchType.PREFILL_LAST,
+        BatchType.DECODE_LAST,
     )
     if is_target_tail:
         state = getattr(model_output, "edge_cloud_draft_state", None)
@@ -504,6 +504,15 @@ def _advance_edge_cloud_draft(
         self._close_draft_pre_out(
             completed_scheduler_output.draft_task_id
         )
+        # The draft chain has fully executed on the cloud; release the KV
+        # blocks retained for requests that finished while the chain was
+        # in flight.
+        release = getattr(
+            self.scheduler, "release_draft_retained_blocks", None
+        )
+        task_id = completed_scheduler_output.draft_task_id
+        if release is not None and task_id:
+            release(task_id)
     draft_token_ids = getattr(
         model_output, "edge_cloud_draft_token_ids", None
     )
@@ -512,18 +521,42 @@ def _advance_edge_cloud_draft(
 
 
 def _clear_pending_edge_cloud_draft_for_finished_requests(self) -> None:
+    """Push draft lifecycle events across the executor boundary.
+
+    Two duties, both driven by scheduler-side state:
+      1. Forward finished request ids to the edge worker so it can mark
+         pending draft contexts.  A context is dropped there only when
+         EVERY request of its parent batch has finished; partial finishes
+         keep the chain — the cloud-side cached attention metadata is
+         whole-batch and cannot be re-sliced.
+      2. Drain draft task ids the scheduler cut from its ready queues:
+         release their retained KV blocks, invalidate the cloud-side
+         cached draft metadata, and force-drop any runner context still
+         held for a cut chain.
+    """
     if not getattr(self, "use_spec_decode", False):
         return
     finished_req_ids = set(
         getattr(self.scheduler, "finished_req_ids", set()) or ()
     )
-    active_draft_req_ids = getattr(
-        self.scheduler,
-        "active_pre_generated_draft_req_ids",
-        lambda: set(),
-    )()
-    finished_req_ids.difference_update(active_draft_req_ids)
-    if not finished_req_ids:
+    take_sched_dropped = getattr(
+        self.scheduler, "take_dropped_draft_task_ids", None
+    )
+    sched_dropped = (
+        take_sched_dropped() if take_sched_dropped is not None else []
+    )
+    release = getattr(
+        self.scheduler, "release_draft_retained_blocks", None
+    )
+    if release is not None:
+        for task_id in sched_dropped:
+            release(task_id)
+    invalidate = getattr(
+        self.scheduler, "invalidate_cloud_draft_tasks", None
+    )
+    if invalidate is not None:
+        invalidate(sched_dropped)
+    if not finished_req_ids and not sched_dropped:
         return
     clear_pending = getattr(
         self.model_executor,
@@ -531,7 +564,45 @@ def _clear_pending_edge_cloud_draft_for_finished_requests(self) -> None:
         None,
     )
     if clear_pending is not None:
-        clear_pending(finished_req_ids)
+        clear_pending(finished_req_ids, sched_dropped)
+
+
+def _register_edge_cloud_draft_parent(
+    self,
+    scheduler_output: SchedulerOutput,
+    model_output: ModelRunnerOutput,
+) -> None:
+    """Retain a parent request when its worker created a draft task."""
+    if not getattr(self, "use_spec_decode", False):
+        return
+    if not self._uses_scheduled_edge_cloud_draft():
+        return
+    if scheduler_output.batch_type not in (
+        BatchType.PREFILL_LAST,
+        BatchType.DECODE_LAST,
+    ):
+        return
+    # Pregeneration is only an optimization and can be skipped while another
+    # draft chain occupies the local queue.  The worker state is authoritative:
+    # _advance_edge_cloud_draft() will enqueue a fallback chain whenever this
+    # state exists, so its parent KV must be retained even without a
+    # pre-generated SchedulerOutput.
+    state = getattr(model_output, "edge_cloud_draft_state", None)
+    if state is None:
+        return
+    task_id = state.get("draft_task_id")
+    parent_task_id = getattr(scheduler_output, "head_token", None)
+    if task_id != parent_task_id:
+        raise RuntimeError(
+            "Edge-cloud draft parent task mismatch: "
+            f"scheduler={parent_task_id}, worker={task_id}"
+        )
+    req_ids = set(scheduler_output.num_scheduled_tokens)
+    register = getattr(
+        self.scheduler, "register_edge_cloud_draft_task", None
+    )
+    if register is not None and task_id and req_ids:
+        register(task_id, req_ids)
 
 
 def _uses_scheduled_edge_cloud_draft(self) -> bool:
@@ -762,6 +833,9 @@ def _patched_step(self):
 
     # Before processing the model output, process any aborts that happened
     # during the model execution.
+    # Register the deferred draft before abort/model completion can free
+    # requests referenced by this parent batch.
+    self._register_edge_cloud_draft_parent(scheduler_output, model_output)
     self._process_aborts_queue()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
@@ -1102,6 +1176,9 @@ def _patched_step_with_batch_queue(self):
             exec_model_fut.result()
             raise RuntimeError("unexpected error")
 
+    # Register the deferred draft before abort/model completion can free
+    # requests referenced by this parent batch.
+    self._register_edge_cloud_draft_parent(scheduler_output, model_output)
     self._process_aborts_queue()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
@@ -1383,6 +1460,9 @@ def install() -> None:
     EngineCore._advance_edge_cloud_draft = _advance_edge_cloud_draft
     EngineCore._clear_pending_edge_cloud_draft_for_finished_requests = (
         _clear_pending_edge_cloud_draft_for_finished_requests
+    )
+    EngineCore._register_edge_cloud_draft_parent = (
+        _register_edge_cloud_draft_parent
     )
     EngineCore._uses_scheduled_edge_cloud_draft = (
         _uses_scheduled_edge_cloud_draft

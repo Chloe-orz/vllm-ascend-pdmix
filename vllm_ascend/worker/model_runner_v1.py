@@ -3030,6 +3030,18 @@ class NPUModelRunner(GPUModelRunner):
             "sample_row_indices": sample_row_indices,
             "req_ids": req_ids,
             "draft_step_idx": 0,
+            # Mid-prefill chunks run the same draft forward to populate MTP
+            # KV, but their proposals must not be exposed to target decode.
+            "is_last_prefill_chunk": getattr(
+                scheduler_output, "is_last_prefill_chunk", True
+            ),
+            "draft_output_req_ids": tuple(
+                getattr(
+                    scheduler_output,
+                    "draft_output_req_ids",
+                    req_ids,
+                )
+            ),
         }
         self._pending_edge_cloud_draft_contexts[task_id] = context
 
@@ -3083,28 +3095,46 @@ class NPUModelRunner(GPUModelRunner):
             self._draft_token_ids_req_ids = None
 
     def clear_pending_edge_cloud_draft_for_req_ids(
-        self, req_ids: set[str] | list[str]
+        self,
+        req_ids: set[str] | list[str],
+        force_drop_task_ids: set[str] | list[str] = (),
     ) -> None:
+        """Mark finished requests on pending deferred drafts.
+
+        Aligned with the non-edge-cloud behavior, where the drafter still
+        runs over the whole verify batch and finished requests' outputs
+        are discarded afterwards: a pending draft context is dropped ONLY
+        when every request of its parent batch has finished.  Partial
+        finishes keep the draft alive — the cloud-side cached attention
+        metadata is whole-batch, so dropping/filtering rows here would
+        desync the token counts; the dead rows' draft tokens are instead
+        discarded when the chain completes (see
+        _run_edge_cloud_draft_last_segment).
+
+        ``force_drop_task_ids`` carries chains the scheduler cut from its
+        ready queues (all requests finished): their contexts are dropped
+        unconditionally.  Dropping a context whose DRAFT_FIRST already
+        executed is safe — the matching DRAFT_LAST drains through the
+        context-is-None path in _run_edge_cloud_draft_last_segment, and
+        worker FIFO ordering guarantees an already-dispatched DRAFT_FIRST
+        ran before this RPC arrives.
+        """
         req_id_set = set(req_ids)
         for req_id in req_id_set:
             self._worker_draft_token_ids_by_req.pop(req_id, None)
-        stale_task_ids = [
-            task_id
-            for task_id, context in (
-                self._pending_edge_cloud_draft_contexts.items()
-            )
-            if req_id_set.intersection(context.get("req_ids") or ())
-        ]
-        for task_id in stale_task_ids:
-            # Keep enqueued contexts whose draft is not yet complete:
-            # they have been converted to a DRAFT_FIRST SchedulerOutput
-            # and the worker will need the context when it executes that
-            # DRAFT_FIRST.  But if the draft IS already complete, the
-            # context was fully consumed and can safely be removed.
-            context = self._pending_edge_cloud_draft_contexts.get(task_id)
-            if context and context.get("enqueued") and not context.get(
-                "draft_complete"
-            ):
+        force_dropped = set(force_drop_task_ids)
+        for task_id, context in list(
+            self._pending_edge_cloud_draft_contexts.items()
+        ):
+            ctx_req_ids = context.get("req_ids") or ()
+            hit = req_id_set.intersection(ctx_req_ids)
+            if hit:
+                finished = context.setdefault("finished_req_ids", set())
+                finished.update(hit)
+                if not all(req_id in finished for req_id in ctx_req_ids):
+                    # Partial finish: keep the draft alive.
+                    continue
+            elif task_id not in force_dropped:
                 continue
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
 
@@ -3384,7 +3414,7 @@ class NPUModelRunner(GPUModelRunner):
             # step. PDSeparatedScheduler derives the next DRAFT_FIRST locally
             # from this completed SchedulerOutput, so no worker-side pending
             # task or follow-up control RPC is needed.
-        else:
+        elif context.get("draft_output_req_ids"):
             self._draft_token_ids = torch.stack(draft_steps, dim=1)
             # Rows of _draft_token_ids follow this context's request order;
             # remember it so the deferred-draft context stash can map rows
@@ -3393,8 +3423,18 @@ class NPUModelRunner(GPUModelRunner):
             # Also record the rows per request: this is the authoritative
             # source for the verify-time spec scatter in _prepare_inputs,
             # which must survive both input-batch re-indexing and later
-            # chains overwriting the global above.
+            # chains overwriting the global above.  Requests that finished
+            # while the chain was in flight are skipped (non-edge-cloud
+            # semantics: dead rows still go through the drafter, their
+            # outputs are discarded here).
+            finished_req_ids = context.get("finished_req_ids") or set()
+            draft_output_req_ids = set(context["draft_output_req_ids"])
             for row, req_id in enumerate(self._draft_token_ids_req_ids):
+                if (
+                    req_id in finished_req_ids
+                    or req_id not in draft_output_req_ids
+                ):
+                    continue
                 self._worker_draft_token_ids_by_req[req_id] = (
                     self._draft_token_ids[row]
                 )
@@ -3402,6 +3442,12 @@ class NPUModelRunner(GPUModelRunner):
                 "[DRAFT-OUT] task=%s drafts=%s",
                 scheduler_output.draft_task_id,
                 self._draft_token_ids.tolist(),
+            )
+        else:
+            logger.info(
+                "[DRAFT-PREFILL] task=%s completed for mid-prefill chunk; "
+                "draft KV populated and proposals discarded",
+                scheduler_output.draft_task_id,
             )
 
         req_ids = list(context["req_ids"])
@@ -3411,10 +3457,21 @@ class NPUModelRunner(GPUModelRunner):
             # fixed-length placeholders and _prepare_input_ids scatters this
             # tensor into the actual verify inputs after this DRL executes.
             # Avoid the device->CPU->EngineCore->scheduler round trip entirely.
-            if not self.use_async_scheduling:
+            if (
+                context.get("draft_output_req_ids")
+                and not self.use_async_scheduling
+            ):
+                output_rows = [
+                    row
+                    for row, req_id in enumerate(req_ids)
+                    if req_id in context["draft_output_req_ids"]
+                ]
                 completed_draft_token_ids = DraftTokenIds(
-                    req_ids,
-                    self._draft_token_ids.detach().cpu().tolist(),
+                    [req_ids[row] for row in output_rows],
+                    self._draft_token_ids[output_rows]
+                    .detach()
+                    .cpu()
+                    .tolist(),
                 )
             task_id = scheduler_output.draft_task_id
             assert task_id is not None
@@ -3742,6 +3799,22 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = cache["cudagraph_mode"]
             batch_desc = cache["batch_desc"]
             cudagraph_stats = cache["cudagraph_stats"]
+            # Restore this batch's discard state as well.  The fast path
+            # skips _prepare_inputs, and the shared discard buffers may have
+            # been overwritten by an interleaved head segment executing
+            # between this batch's head and tail (e.g. the last chunk's
+            # PREFILL_FIRST, which discards nothing, running before a
+            # mid-chunk PREFILL_LAST).  Without the restore, a mid-chunk PL
+            # returns its (prompt-predicting) sampled token to the
+            # scheduler, double-decrementing num_output_placeholders and
+            # tripping the assert in AsyncScheduler._update_request_with_output.
+            self.num_discarded_requests = cache["num_discarded_requests"]
+            self.discard_request_indices.np[: self.num_discarded_requests] = (
+                cache["discard_request_indices"]
+            )
+            self.discard_request_indices.copy_to_gpu(
+                self.num_discarded_requests
+            )
             # Re-sync num_computed_tokens from CPU: segment_a forward or
             # async state update may have modified the GPU buffer.
             # NOTE: In async speculative decoding, segment_a has already
@@ -4082,6 +4155,14 @@ class NPUModelRunner(GPUModelRunner):
                 "cudagraph_stats": cudagraph_stats,
                 "total_num_scheduled_tokens": total_num_scheduled_tokens,
                 "positions": positions,
+                # Discard state is part of the prepare results too: the
+                # segment_e fast path skips _prepare_inputs and must restore
+                # this batch's own values instead of inheriting whatever an
+                # interleaved head segment left in the shared buffers.
+                "num_discarded_requests": self.num_discarded_requests,
+                "discard_request_indices": self.discard_request_indices.np[
+                    : self.num_discarded_requests
+                ],
             }
             self._edge_prepare_cache_by_token[scheduler_output.head_token] = (
                 _freeze_scheduled_state(cache_entry)
@@ -4479,37 +4560,62 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # [ascend insert] Chunk-prior mid-chunk PL: prefill is not
-        # complete, so there is no valid token to sample (the logits
-        # predict a prompt token that belongs to the next chunk).  Skip
-        # sampling and return an empty output.  This also prevents
-        # num_output_placeholders -- which vLLM only reserves for the
-        # last prefill chunk (AsyncScheduler._update_after_schedule skips
-        # is_prefill_chunk) -- from being decremented below zero in
-        # _update_request_with_output.  segment_e / KV-cache write
-        # already happened in execute_model, so skipping sampling here
-        # does not affect prefill correctness.
-        if (
+        is_mid_prefill_chunk = bool(
             self._edge_cloud_enabled
             and scheduler_output.batch_type == BatchType.PREFILL_LAST
-            and not getattr(scheduler_output, "is_last_prefill_chunk", True)
-        ):
-            # Mid chunk: no valid token to sample. Return a placeholder that
-            # carries the req_id mapping (so super().update_from_output can
-            # look up req_index for every req_id in num_scheduled_tokens)
-            # but leaves sampled_token_ids empty (default []), so
-            # generated_token_ids is [] and _update_request_with_output is
-            # skipped -- num_output_placeholders is not decremented. Do NOT
-            # return EMPTY_MODEL_RUNNER_OUTPUT here: its req_id_to_index is
-            # empty, which raises KeyError in update_from_output.
-            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+            and not getattr(
+                scheduler_output, "is_last_prefill_chunk", True
+            )
+        )
+        can_skip_mid_prefill_sampling = bool(
+            is_mid_prefill_chunk
+            and self.speculative_config is None
+            and not self.num_prompt_logprobs
+            and not self.model_config.enable_return_routed_experts
+            and not self.need_accepted_tokens
+        )
+        if can_skip_mid_prefill_sampling:
+            # With no drafter and no sampling-dependent auxiliary output, a
+            # middle chunk has no valid generated token.  Its target KV was
+            # already written by execute_model(), so avoid the sampler and
+            # bookkeeping while preserving the normal connector/profiling
+            # output and end-of-forward hooks.
+            req_ids = list(scheduler_output.num_scheduled_tokens)
             output = ModelRunnerOutput(
                 req_ids=req_ids,
                 req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+                kv_connector_output=kv_connector_output,
+                pooler_output=[],
+                ec_connector_output=(
+                    ec_connector_output if self.supports_mm_inputs else None
+                ),
+                cudagraph_stats=cudagraph_stats,
+                **(
+                    {}
+                    if vllm_version_is("0.20.2")
+                    else {"routed_experts": None}
+                ),
             )
-            if kv_connector_output and not kv_connector_output.is_empty():
-                output.kv_connector_output = kv_connector_output
+            if (
+                self.ascend_config.profiling_chunk_config.need_timing
+                and hasattr(self, "_execution_start_time")
+            ):
+                self._sync_device()
+                output.execution_time_ms = (
+                    time.perf_counter() - self._execution_start_time
+                ) * 1000.0
+            if self.dynamic_eplb:
+                with record_function_or_nullcontext("EPLB update"):
+                    self.eplb_updator.forward_end()
+            self._finalize_dump_data()
             return output
+
+        # With speculative decoding enabled, a mid-prefill chunk intentionally
+        # continues through sampling and drafting. _prepare_inputs marked it
+        # in discard_request_indices, so bookkeeping emits no target token and
+        # prepare_next_token_ids_padded feeds the real next prompt token to the
+        # drafter. This mirrors the native non-edge-cloud path and is required
+        # to populate MTP KV for the entire prompt.
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4979,6 +5085,58 @@ class NPUModelRunner(GPUModelRunner):
             )
         return base_positions + draft_step_idx
 
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        result = super()._update_states(scheduler_output)
+        self._purge_invalidated_cloud_draft_metadata(
+            getattr(scheduler_output, "cloud_draft_invalidate_task_ids", None)
+        )
+        return result
+
+    def _purge_invalidated_cloud_draft_metadata(
+        self, task_ids: list[str] | None
+    ) -> None:
+        """Cloud-side purge of draft metadata for edge-dropped tasks.
+
+        The edge drops a deferred draft when every request of its parent
+        verify/prefill batch finished (or was aborted), so the DRAFT
+        batch never (fully) arrives and the normal pop at the last draft
+        step never runs.  The edge stamps the affected task ids on a
+        later SchedulerOutput (``cloud_draft_invalidate_task_ids``);
+        purge the entries here instead of letting them occupy the
+        bounded cache until eviction (which could otherwise evict a
+        still-in-flight task and crash its DRAFT with "no matching
+        target attention metadata").  The edge only invalidates tasks
+        whose draft was never published/dispatched or already fully
+        consumed, so purging cannot race an in-flight DRAFT batch.
+
+        Only active on the cloud side with scheduled edge-cloud draft;
+        a no-op everywhere else.
+        """
+        if not task_ids:
+            return
+        if not (
+            self._edge_cloud_enabled
+            and not is_edge_device()
+            and self._uses_scheduled_edge_cloud_draft()
+        ):
+            return
+        for task_id in task_ids:
+            if (
+                self._cloud_spec_decode_metadata_by_task.pop(task_id, None)
+                is not None
+            ):
+                logger.info(
+                    "Purged cloud draft metadata for invalidated "
+                    "task_id=%s (draft dropped on the edge)",
+                    task_id,
+                )
+            self._cloud_scheduler_output_by_task.pop(task_id, None)
+            # NOTE: the original fix (518616040) forgot this dict; its
+            # cloned positions tensors would otherwise linger until the
+            # bounded metadata cache evicts the task.
+            self._cloud_draft_position_state_by_task.pop(task_id, None)
+            self._eagle3_cloud_aux_hidden_states_by_task.pop(task_id, None)
+
     def _build_edge_cloud_draft_attn_metadata(
         self,
         positions: torch.Tensor,
@@ -5246,6 +5404,13 @@ class NPUModelRunner(GPUModelRunner):
         The worker records (rather than waits for) the cloud->edge send,
         exactly like ``_execute_model_cloud``.
         """
+        # DRAFT batches bypass execute_model/_update_states on the cloud, so
+        # the purge hook there never runs for them.  Consume any piggybacked
+        # draft-metadata invalidations here instead; the call is a guarded
+        # no-op off the cloud path.
+        self._purge_invalidated_cloud_draft_metadata(
+            getattr(scheduler_output, "cloud_draft_invalidate_task_ids", None)
+        )
         spec_step_idx = int(scheduler_output.draft_step_idx or 0)
         # The edge carries rejection-corrected sampling state on the step-0
         # SchedulerOutput. Keeping it on the control plane avoids extra CPU
