@@ -906,13 +906,15 @@ class PDSeparatedScheduler(Scheduler):
         return BatchType.EMPTY
 
     def _assign_original_seq(self, scheduler_output: SchedulerOutput) -> None:
-        """Stamp a monotonic edge-production sequence number.
+        """Stamp the next global edge original_seq on a SchedulerOutput.
 
-        Mirrors ``head_token``: assigned once when the edge first produces a
-        real head-segment batch (P首/D首/Draft首) or a dummy, so the edge and
-        cloud workers can log it before inference and correlate edge-vs-cloud
-        execution of the same logical batch. Tails inherit it via
-        :func:`dataclasses.replace`. Distinct from the cloud-side
+        Advances ``_original_seq_counter`` and assigns the new value, so every
+        edge segment - head (P首/D首/Draft首), tail (P尾/D尾/Draft尾), and
+        dummy - gets a unique monotonic number that the edge and cloud workers
+        can log before inference to correlate edge-vs-cloud execution. Heads
+        and edge-pre-generated tails (D尾/Draft尾) are stamped at production;
+        the cloud-echoed P尾 is stamped when the edge picks it (discarding the
+        echoed head value). Distinct from the cloud-side
         ``_passive_scheduler_arrival_seq`` (reception order).
         """
         self._original_seq_counter += 1
@@ -1257,11 +1259,10 @@ class PDSeparatedScheduler(Scheduler):
         assert so.batch_type == BatchType.PREFILL_LAST, (
             f"prefills_last_ready expects PREFILL_LAST, got {so.batch_type}"
         )
-        # Tail segment: the cloud echoed PF's original_seq unchanged via
-        # replace; bump it by 1 here so head (PF=N) and tail (PL=N+1) of the
-        # same prefill are consecutive and distinguishable in [EC-EXEC] logs.
-        if so.original_seq is not None:
-            so.original_seq += 1
+        # Tail segment: assign the next global original_seq (advances the
+        # counter), discarding the head value echoed by the cloud, so every
+        # edge segment gets a unique monotonic number.
+        self._assign_original_seq(so)
         # [ascend insert] Mark whether this PL is the request's last
         # prefill chunk.  Mid-chunk PL must not sample: prefill is still
         # incomplete, and the would-be sampled token actually predicts a
@@ -1350,10 +1351,9 @@ class PDSeparatedScheduler(Scheduler):
             num_accepted_tokens=None,
             valid_sampled_token_count=None,
         )
-        # Tail segment: bump original_seq by 1 (head DRAFT_FIRST=N ->
-        # tail DRAFT_LAST=N+1).
-        if draft_last.original_seq is not None:
-            draft_last.original_seq += 1
+        # Tail segment: assign the next global original_seq (advances the
+        # counter) so every edge segment gets a unique monotonic number.
+        self._assign_original_seq(draft_last)
         self._validate_draft_tail_channel(draft_last)
         self.drafts_last_ready.append(draft_last)
         self.decode_or_draft_inflight_count += 1
@@ -1591,11 +1591,10 @@ class PDSeparatedScheduler(Scheduler):
                         scheduler_output,
                         batch_type=BatchType.DECODE_LAST,
                     )
-                    # Tail segment: bump original_seq by 1 so head (DF=N) and
-                    # tail (DL=N+1) of the same batch are consecutive and
-                    # distinguishable in the [EC-EXEC] logs.
-                    if decode_last.original_seq is not None:
-                        decode_last.original_seq += 1
+                    # Tail segment: assign the next global original_seq
+                    # (advances the counter) so every edge segment - head,
+                    # tail, dummy - gets a unique monotonic number.
+                    self._assign_original_seq(decode_last)
                     self.decodes_last_ready.append(decode_last)
                     # ===============================================
                 for req in list(self.waiting):
