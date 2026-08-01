@@ -253,6 +253,23 @@ def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
         scheduler_output.head_token = uuid4().hex
 
 
+def _ensure_pd_original_seq(self, scheduler_output: SchedulerOutput) -> None:
+    """Stamp the edge-side original_seq on an EngineCore-created dummy.
+
+    The scheduler stamps real head-segment batches (PF/DF/DRAFT_FIRST) and
+    its own coordinated dummies at production time. Dummies built directly
+    in the EngineCore for cross-DP coordination (see
+    ``_patched_execute_dummy_batch`` / ``_publish_pd_dummy_zmq``) bypass
+    that path, so stamp them here via the scheduler's counter. This keeps
+    every edge-produced SchedulerOutput - including all DP-parallel dummies -
+    on one monotonic original_seq sequence, so the cloud worker's [EC-EXEC]
+    log never shows a dummy with original_seq=None.
+    """
+    _assign = getattr(self.scheduler, "_assign_original_seq", None)
+    if _assign is not None:
+        _assign(scheduler_output)
+
+
 def _needs_sample_tokens(self, scheduler_output: SchedulerOutput) -> bool:
     """Return True if sample_tokens should follow execute_model for this
     batch.
@@ -1152,6 +1169,7 @@ def _patched_execute_dummy_batch(self):
         dummy_so.batch_type = _BatchType.DECODE_FIRST
         dummy_so.hidden_channel = _HiddenChannelType.DECODE
         dummy_so.head_token = uuid4().hex
+        self._ensure_pd_original_seq(dummy_so)
         # Dynamic marker consumed by cloud _execute_model_cloud / PassiveEngineCore.step.
         setattr(dummy_so, "is_pd_dummy", True)
         ch.publish(dummy_so)
@@ -1179,6 +1197,7 @@ def _publish_pd_dummy_zmq(self):
     dummy_so.batch_type = _BatchType.DECODE_FIRST
     dummy_so.hidden_channel = _HiddenChannelType.DECODE
     dummy_so.head_token = uuid4().hex
+    self._ensure_pd_original_seq(dummy_so)
     setattr(dummy_so, "is_pd_dummy", True)
     ch.publish(dummy_so)
 
@@ -1194,6 +1213,7 @@ def install() -> None:
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
     EngineCore._ensure_pd_head_token = _ensure_pd_head_token
+    EngineCore._ensure_pd_original_seq = _ensure_pd_original_seq
     EngineCore._needs_sample_tokens = _needs_sample_tokens
     EngineCore._stash_empty_worker_cleanup = _stash_empty_worker_cleanup
     EngineCore._merge_pending_worker_cleanup = _merge_pending_worker_cleanup

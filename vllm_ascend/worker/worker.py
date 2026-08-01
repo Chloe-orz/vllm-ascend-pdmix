@@ -826,6 +826,23 @@ class NPUWorker(WorkerBase):
 
         # Edge-cloud PD-separation: dispatch by batch_type and role.
         if self.model_runner._edge_cloud_enabled:
+            # [EC-EXEC] Log the edge-side original_seq (assigned at edge
+            # production) before inference so edge and cloud worker execution
+            # of the same logical batch can be correlated. arrival_seq is the
+            # cloud-side reception order (best-effort: present on the cloud
+            # worker only if it survived the internal EngineCore->worker MQ).
+            logger.info(
+                "[EC-EXEC] role=%s rank=%s original_seq=%s arrival_seq=%s "
+                "batch_type=%s tokens=%s head_token=%s",
+                "CLOUD" if is_cloud_device() else "EDGE",
+                self.rank,
+                getattr(scheduler_output, "original_seq", None),
+                getattr(scheduler_output, "_passive_scheduler_arrival_seq", None),
+                scheduler_output.batch_type.value
+                if scheduler_output.batch_type else None,
+                scheduler_output.total_num_scheduled_tokens,
+                getattr(scheduler_output, "head_token", None),
+            )
             bt = scheduler_output.batch_type
             if is_cloud_device():
                 if bt == BatchType.DRAFT_FIRST:

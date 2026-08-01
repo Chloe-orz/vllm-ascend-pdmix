@@ -229,6 +229,14 @@ class PDSeparatedScheduler(Scheduler):
 
         self._step_counter: int = 0
 
+        # Monotonic edge-production sequence number stamped on every real
+        # head-segment SchedulerOutput (and dummy) the edge produces, so edge
+        # and cloud workers can correlate edge-vs-cloud execution. Mirrors
+        # head_token: assigned once at production, inherited by tails via
+        # dataclasses.replace. Distinct from the cloud-side
+        # _passive_scheduler_arrival_seq (reception order).
+        self._original_seq_counter: int = 0
+
         # In-flight prefill limit (head-segment batches).
         self.prefill_inflight_limit: int = getattr(
             self.scheduler_config, "pd_prefill_inflight_limit",
@@ -897,6 +905,29 @@ class PDSeparatedScheduler(Scheduler):
             return BatchType.PREFILL_LAST
         return BatchType.EMPTY
 
+    def _assign_original_seq(self, scheduler_output: SchedulerOutput) -> None:
+        """Stamp a monotonic edge-production sequence number.
+
+        Mirrors ``head_token``: assigned once when the edge first produces a
+        real head-segment batch (P首/D首/Draft首) or a dummy, so the edge and
+        cloud workers can log it before inference and correlate edge-vs-cloud
+        execution of the same logical batch. Tails inherit it via
+        :func:`dataclasses.replace`. Distinct from the cloud-side
+        ``_passive_scheduler_arrival_seq`` (reception order).
+        """
+        self._original_seq_counter += 1
+        seq = self._original_seq_counter
+        scheduler_output.original_seq = seq
+        logger.info(
+            "[EC-ORIG] edge produced original_seq=%s batch_type=%s tokens=%s "
+            "head_token=%s",
+            seq,
+            scheduler_output.batch_type.value
+            if scheduler_output.batch_type else None,
+            scheduler_output.total_num_scheduled_tokens,
+            getattr(scheduler_output, "head_token", None),
+        )
+
     def _make_pd_dummy_batch(self, bt: BatchType) -> SchedulerOutput:
         """Construct a PD-separation dummy SchedulerOutput of batch_type=bt.
 
@@ -909,6 +940,7 @@ class PDSeparatedScheduler(Scheduler):
         so = SchedulerOutput.make_empty()
         so.batch_type = bt
         so.head_token = uuid4().hex
+        self._assign_original_seq(so)
         if bt in (BatchType.PREFILL_FIRST, BatchType.PREFILL_LAST):
             so.hidden_channel = HiddenChannelType.PREFILL_1
         else:
@@ -1015,6 +1047,7 @@ class PDSeparatedScheduler(Scheduler):
                 else:
                     scheduler_output.batch_type = BatchType.PREFILL_FIRST
                     scheduler_output.head_token = uuid4().hex
+                    self._assign_original_seq(scheduler_output)
                     scheduler_output.hidden_channel = (
                         self.hidden_channel_manager.allocate_prefill(
                             scheduler_output.head_token
@@ -1296,6 +1329,7 @@ class PDSeparatedScheduler(Scheduler):
         scheduler_output.batch_type = BatchType.DRAFT_FIRST
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
+        self._assign_original_seq(scheduler_output)
         scheduler_output.hidden_channel = HiddenChannelType.DECODE
         # Draft-first self-posting mirrors the decode path below. Every
         # field needed by DRAFT_LAST is already known on the edge; the cloud
@@ -1528,6 +1562,7 @@ class PDSeparatedScheduler(Scheduler):
                 else:
                     scheduler_output.batch_type = BatchType.DECODE_FIRST
                     scheduler_output.head_token = uuid4().hex
+                    self._assign_original_seq(scheduler_output)
                     scheduler_output.hidden_channel = (
                         self.hidden_channel_manager.decode_channel()
                     )
