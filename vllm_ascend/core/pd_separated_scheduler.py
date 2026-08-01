@@ -1257,6 +1257,11 @@ class PDSeparatedScheduler(Scheduler):
         assert so.batch_type == BatchType.PREFILL_LAST, (
             f"prefills_last_ready expects PREFILL_LAST, got {so.batch_type}"
         )
+        # Tail segment: the cloud echoed PF's original_seq unchanged via
+        # replace; bump it by 1 here so head (PF=N) and tail (PL=N+1) of the
+        # same prefill are consecutive and distinguishable in [EC-EXEC] logs.
+        if so.original_seq is not None:
+            so.original_seq += 1
         # [ascend insert] Mark whether this PL is the request's last
         # prefill chunk.  Mid-chunk PL must not sample: prefill is still
         # incomplete, and the would-be sampled token actually predicts a
@@ -1345,6 +1350,10 @@ class PDSeparatedScheduler(Scheduler):
             num_accepted_tokens=None,
             valid_sampled_token_count=None,
         )
+        # Tail segment: bump original_seq by 1 (head DRAFT_FIRST=N ->
+        # tail DRAFT_LAST=N+1).
+        if draft_last.original_seq is not None:
+            draft_last.original_seq += 1
         self._validate_draft_tail_channel(draft_last)
         self.drafts_last_ready.append(draft_last)
         self.decode_or_draft_inflight_count += 1
@@ -1582,6 +1591,11 @@ class PDSeparatedScheduler(Scheduler):
                         scheduler_output,
                         batch_type=BatchType.DECODE_LAST,
                     )
+                    # Tail segment: bump original_seq by 1 so head (DF=N) and
+                    # tail (DL=N+1) of the same batch are consecutive and
+                    # distinguishable in the [EC-EXEC] logs.
+                    if decode_last.original_seq is not None:
+                        decode_last.original_seq += 1
                     self.decodes_last_ready.append(decode_last)
                     # ===============================================
                 for req in list(self.waiting):
