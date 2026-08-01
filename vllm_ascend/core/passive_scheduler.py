@@ -973,6 +973,38 @@ class PassiveScheduler:
             if decision.cloud_suggest_slicing is not None else "-",
         )
 
+    def _decode_arrived_before_prefill(self) -> bool:
+        """True when both ready_prefills and ready_decodes are non-empty and
+        the ready decode arrived strictly before the ready prefill (by
+        arrival_seq).
+
+        Overrides the EXPECT_EXECUTE_PREFILL default (prefill-first) so a
+        prefill does not jump ahead of an earlier-arriving decode. That
+        reordering makes the cloud prefill-middle irecv an edge prefill-head
+        the edge worker has not sent yet (it is still on the decode tail
+        waiting for the cloud decode-middle) -> cross-batch edge<->cloud
+        deadlock. Mirrors _schedule_by_arrival, but is NOT gated on slicing
+        so the no-slice case (layer_slice_config all 1) is also covered.
+        """
+        if not (self.ready_prefills and self.ready_decodes):
+            return False
+        pf_seq = self._arrival_seq(self.ready_prefills[0])
+        dc_seq = self._arrival_seq(self.ready_decodes[0])
+        return pf_seq is not None and dc_seq is not None and dc_seq < pf_seq
+
+    def _prefill_arrived_before_decode(self) -> bool:
+        """Symmetric of _decode_arrived_before_prefill for EXPECT_EXECUTE_DECODE:
+        the ready prefill arrived strictly before the ready decode. Doing the
+        decode first would irecv an edge decode-head the edge worker has not
+        sent (it is still on the prefill tail) -> the same cross-batch
+        deadlock.
+        """
+        if not (self.ready_prefills and self.ready_decodes):
+            return False
+        pf_seq = self._arrival_seq(self.ready_prefills[0])
+        dc_seq = self._arrival_seq(self.ready_decodes[0])
+        return pf_seq is not None and dc_seq is not None and pf_seq < dc_seq
+
     def _make_decision_alternation(self) -> SchedulerDecision:
         """Read-only: produce a ``SchedulerDecision`` from the current
         state machine, throttle, and ready queues.  Zero side effects."""
@@ -997,6 +1029,22 @@ class PassiveScheduler:
                     ) if self._active_sliced_prefill else None,
                 )
             if self.ready_prefills:
+                # Arrival-order: if a decode arrived before this prefill, do
+                # the decode first (see _decode_arrived_before_prefill). Stays
+                # in EXPECT_EXECUTE_PREFILL so the prefill is dispatched next
+                # tick. Without this a prefill jumps ahead of an earlier
+                # decode and the cloud prefill-middle irecvs an edge prefill-
+                # head the edge worker has not sent (it is still on the decode
+                # tail) -> cross-batch edge<->cloud deadlock.
+                if self._decode_arrived_before_prefill():
+                    _so = self.ready_decodes[0]
+                    return SchedulerDecision(
+                        batch_type=_so.batch_type,
+                        dispatch_queue="ready_decodes",
+                        token_count=_so.total_num_scheduled_tokens,
+                        throttle_action="clear",
+                        cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
+                    )
                 _so = self.ready_prefills[0]
                 return SchedulerDecision(
                     batch_type=_so.batch_type,
@@ -1016,6 +1064,25 @@ class PassiveScheduler:
                     cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
                 )
         else:  # EXPECT_EXECUTE_DECODE
+            # Arrival-order (symmetric): if a prefill arrived before the ready
+            # decode, do the prefill first (see _prefill_arrived_before_decode)
+            # so the cloud does not irecv an edge decode-head the edge worker
+            # has not sent (it is still on the prefill tail). Gated on the
+            # non-sliced fallback condition so in-progress slice interleaving
+            # is not disrupted.
+            '''
+            if (self.ready_decodes
+                    and self._can_fallback_to_prefill_in_decode_state()
+                    and self._prefill_arrived_before_decode()):
+                _so = self.ready_prefills[0]
+                return SchedulerDecision(
+                    batch_type=_so.batch_type,
+                    dispatch_queue="ready_prefills",
+                    token_count=_so.total_num_scheduled_tokens,
+                    throttle_action="start",
+                    cloud_suggest_slicing=getattr(_so, "cloud_suggest_slicing", None),
+                )
+            '''
             if self.ready_decodes:
                 _so = self.ready_decodes[0]
                 return SchedulerDecision(
