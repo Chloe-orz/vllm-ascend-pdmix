@@ -71,7 +71,10 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import (
+    CommonAttentionMetadata,
+    reorder_batch_to_split_decodes_and_prefills,
+)
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import (
     BatchType,
@@ -329,6 +332,33 @@ class EdgeCloudSegment(torch.nn.Module):
             is_last_segment=self._is_last_segment,
             **extra_layer_kwargs,
         )
+
+def _reorder_input_batch_to_so_order(input_batch, scheduler_output) -> bool:
+    """Reorder ``input_batch`` so its request order matches the
+    ``num_scheduled_tokens`` key order of ``scheduler_output``.
+
+    Edge-cloud wire alignment: the e2c/c2e hidden/mrope transfer is laid
+    out flat in the sender's ``input_batch`` order and consumed in the
+    receiver's ``input_batch`` order.  The two sides' batch histories
+    diverge under PD interleaving: the edge additionally executes PL/DL
+    tail segments whose normal-path ``_update_states`` removes and
+    re-adds requests (a request whose PL was interleaved with decode
+    batches lands at index 0 on the edge but is appended at the end on
+    the cloud).  Since the SchedulerOutput is the SAME object on both
+    sides, its ``num_scheduled_tokens`` key order is a canonical order
+    both runners can converge to.  ``swap_states`` keeps
+    ``req_id_to_index`` and all per-request rows in sync.
+    """
+    target = list(scheduler_output.num_scheduled_tokens.keys())
+    if len(target) != input_batch.num_reqs or list(
+            input_batch.req_ids) == target:
+        return False
+    for dst, req_id in enumerate(target):
+        src = input_batch.req_id_to_index[req_id]
+        if src != dst:
+            input_batch.swap_states(src, dst)
+    return True
+
 
 @dataclass
 class HeadState:
@@ -8811,6 +8841,57 @@ class NPUModelRunner(GPUModelRunner):
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()
+
+    def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
+        """Edge-cloud embedding_only: keep the edge's ``input_batch`` order in
+        sync with the cloud's so the metadata-free e2c tensor transfer stays
+        layout-aligned.
+
+        In embedding_only the edge runs NO attention layers (head_k=tail_k=0),
+        so ``kv_cache_groups`` is empty and the base ``_may_reorder_batch``
+        returns early WITHOUT reordering. The cloud, however, runs the full
+        transformer and its attention backend sets ``reorder_batch_threshold``
+        (=1, or 1 + num_speculative_tokens), so the cloud DOES reorder
+        (``reorder_batch_to_split_decodes_and_prefills`` moves prefills to the
+        end of ``input_batch``). The e2c transfer sends tensors in the edge's
+        order and the cloud reads them in the cloud's order; if only the cloud
+        reorders, the two orders diverge and the cloud reads each request's
+        mrope/hidden from the wrong buffer offset (dec_off mismatch -> wrong
+        RoPE position -> token divergence). Apply the SAME reorder on the
+        edge, using the cloud's threshold, so both sides share an identical
+        ``input_batch`` order.
+        """
+        if self._edge_cloud_enabled:
+            # Under PD interleaving the edge's input_batch history diverges
+            # from the cloud's (PL/DL tails that miss the fast path run a
+            # full _update_states, removing/re-adding requests at different
+            # positions). Re-anchor BOTH sides to the SO's
+            # num_scheduled_tokens key order at every batch so the flat
+            # e2c/c2e wire layout always matches the consumer's batch
+            # layout. Without this, after a prefill joins the decode batch
+            # via an interleaved PL, the edge sends hidden/mrope ordered
+            # [A, Z1, Z2] while the cloud reads [Z1, Z2, A] and every
+            # request decodes with another request's embeds/mrope.
+            _reorder_input_batch_to_so_order(self.input_batch,
+                                             scheduler_output)
+        if (self._edge_cloud_enabled
+                and self.edge_cloud_cfg.mode == "embedding_only"
+                and self.edge_cloud_cfg.role == "edge"):
+            if self.reorder_batch_threshold is not None:
+                threshold = self.reorder_batch_threshold
+            else:
+                # Match the ascend attention backend's decode_threshold
+                # (=1, or 1 + num_speculative_tokens under spec decode).
+                threshold = 1
+                if self.speculative_config is not None:
+                    threshold = 1 + self.speculative_config.num_speculative_tokens
+            reorder_batch_to_split_decodes_and_prefills(
+                self.input_batch,
+                scheduler_output,
+                decode_threshold=threshold,
+            )
+            return
+        super()._may_reorder_batch(scheduler_output)
 
     def calculate_reorder_batch_threshold(self) -> None:
         """
