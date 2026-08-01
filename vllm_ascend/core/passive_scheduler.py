@@ -831,7 +831,7 @@ class PassiveScheduler:
         """Original single-DP EEP/EED state machine (no cross-DP coord)."""
         state = self.cloud_scheduling_state
         self._log_queue_state("simple-enter")
-        logger.error(
+        logger.debug(
             "[COORD-DIAG] DP%s simple-enter state=%s",
             getattr(self.vllm_config.parallel_config, "data_parallel_rank", 0),
             state.name,
@@ -942,7 +942,7 @@ class PassiveScheduler:
         dec_items = [_pf_str(so) for so in self.ready_decodes]
         pdmix_items = [_pf_str(so) for so in self.ready_pdmixes]
         as_items = [_si_str(t) for t in self._active_prefill_slices]
-        logger.error(
+        logger.debug(
             "[COORD-DIAG] step=%d DP%s %s state=%s "
             "pf[%d]=[%s] dec[%d]=[%s] pdmix[%d]=[%s] "
             "active_slices[%d]=[%s]",
