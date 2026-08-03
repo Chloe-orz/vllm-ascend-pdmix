@@ -789,6 +789,25 @@ class PassiveScheduler:
         slices = self._slice_for(self.ready_prefills[0])
         return len(slices) > 1 and isinstance(slices[0], LayerSliceInfo)
 
+    def _ready_prefill_head_is_dummy(self) -> bool:
+        """True when the ready_prefills head is an edge placeholder dummy.
+
+        A PREFILL_FIRST dummy carries total_num_scheduled_tokens==0 (the
+        is_pd_dummy marker is lost in zmq serialization, so the cloud
+        detects it by tokens==0).  It is never sliced, so on a single DP it
+        needs no arrival-order arbitration.  But under coordinated + replay
+        scheduling, DP0's prefill decision propagates to peer DPs via
+        _replay_by_deltas, and the edge-cloud hidden channel requires both
+        sides to run the same batch_type per tick.  Letting a dummy skip
+        _schedule_by_arrival can therefore force the cloud to run prefill
+        while the edge runs decode (the decode arrived first) -- a
+        cross-side hidden-channel mismatch deadlock.  Route dummies through
+        _schedule_by_arrival so the arrival order still wins.
+        """
+        if not self.ready_prefills:
+            return False
+        return self.ready_prefills[0].total_num_scheduled_tokens == 0
+
     def _schedule_by_arrival(self) -> ScheduledBatch:
         prefill_seq = self._arrival_seq(self.ready_prefills[0])
         decode_seq = self._arrival_seq(self.ready_decodes[0])
@@ -975,7 +994,10 @@ class PassiveScheduler:
             if self.ready_prefills:
                 if (
                     self.ready_decodes
-                    and self._ready_prefill_is_sliced_first_block()
+                    and (
+                        self._ready_prefill_is_sliced_first_block()
+                        or self._ready_prefill_head_is_dummy()
+                    )
                 ):
                     return self._schedule_by_arrival()
                 self.cloud_scheduling_state = (
