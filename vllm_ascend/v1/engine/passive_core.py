@@ -636,7 +636,7 @@ class PassiveEngineCoreProc:
 
         if batch.is_empty():
             if _dt_drain > 1.0 or _dt_poll > 1.0 or _dt_sched > 1.0:
-                logger.info(
+                logger.debug(
                     "[CLOUD-STEP-EMPTY] drain_acks=%.3f ms, poll=%.3f ms, "
                     "schedule=%.3f ms",
                     _dt_drain, _dt_poll, _dt_sched,

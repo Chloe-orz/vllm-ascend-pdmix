@@ -979,7 +979,7 @@ class PassiveScheduler:
     def _schedule_expect_alternation_simple(self) -> ScheduledBatch:
         """Original single-DP EEP/EED state machine (no cross-DP coord)."""
         state = self.cloud_scheduling_state
-        logger.error(
+        logger.debug(
             "[COORD-DIAG] DP%s simple-enter state=%s",
             getattr(self.vllm_config.parallel_config, "data_parallel_rank", 0),
             state.name,
