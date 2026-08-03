@@ -641,10 +641,15 @@ class NPUWorker(WorkerBase):
             self.model_runner.edge_cloud_cfg.mode != "embedding_only"
             or not self.model_runner.supports_mm_inputs)
         merge_payload = get_edge_cloud_tensor_meta().merge_payload
+        # In the shared-model edge-cloud topology the cloud first-worker
+        # must receive from the edge (in-group rank 0).  Otherwise src=None
+        # resolves to the implicit "previous PP rank".
+        _recv_src = 0 if self.parallel_config.is_shared_model_edge else None
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
             num_tokens=num_tokens,
             channel=channel,
             sp_chunk=do_sp_chunk and merge_payload,
+            src=_recv_src,
         )
         if do_sp_chunk and not merge_payload:
             tensor_dict = {
