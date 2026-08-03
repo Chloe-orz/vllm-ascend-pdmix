@@ -1037,6 +1037,25 @@ class PassiveScheduler:
             len(self._active_prefill_slices),
         )
 
+    def _replay_prefill_with_slices(
+        self, d_slices: int,
+    ) -> ScheduledBatch:
+        """复刻 DP0 的 prefill 操作，绕过 _slice_for 的动态决策。
+
+        _slice_for 依赖 self.ready_decodes / cloud_suggest_slicing 等 DP 本地
+        队列状态，DP1 复刻时这些状态可能与 DP0 执行时不同，导致切片数量不一致。
+        该方法直接使用 d_slices 反推 total_slices，确保 DP1 与 DP0 产生相同的
+        _active_prefill_slices 变化。
+        """
+        so = self.ready_prefills.popleft()
+        if d_slices > 0:
+            slices = self._do_slice(so, total_slices=d_slices + 1)
+            batch = self._gen_batch_by_slices(so, slices)
+        else:
+            batch = ScheduledBatch(scheduler_output=so, slices=[None])
+        self._log_picked_batch(batch)
+        return batch
+
     def _replay_by_deltas(
         self,
         d_prefills: int,
@@ -1051,10 +1070,7 @@ class PassiveScheduler:
         if d_slices == -1:
             return self._build_active_prefill_slice_batch()
         elif d_prefills == -1:
-            return self._build_batch(
-                self.ready_prefills.popleft(),
-                total_slices=d_slices + 1,
-            )
+            return self._replay_prefill_with_slices(d_slices)
         elif d_decodes == -1:
             return self._build_batch(
                 self.ready_decodes.popleft(),
