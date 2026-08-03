@@ -6172,6 +6172,22 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
+    @staticmethod
+    def _unwrap_layerwise_aux_hidden_state_output(
+        hidden_states: Any,
+    ) -> Any:
+        """Return the primary hidden states from a layerwise model output.
+
+        A final local model segment may return the usual
+        ``(hidden_states, aux_hidden_states)`` pair when Eagle3 auxiliary
+        outputs are enabled. Non-final layer slices and edge-cloud cloud
+        segments instead return ``IntermediateTensors`` and must stay intact
+        for the following slice or edge segment.
+        """
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states, _ = hidden_states
+        return hidden_states
+
     def _execute_layerwise_continuation(
         self,
         layer_slice_info: Any,
@@ -6244,7 +6260,9 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("layerwise post process"):
             if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = hidden_states
+                hidden_states = self._unwrap_layerwise_aux_hidden_state_output(
+                    hidden_states
+                )
             if self.pcp_size > 1:
                 hidden_states = self.pcp_manager.get_restore_hidden_states(
                     hidden_states
