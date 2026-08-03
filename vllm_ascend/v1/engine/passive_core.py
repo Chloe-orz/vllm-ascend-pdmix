@@ -1017,18 +1017,61 @@ class PassiveEngineCoreProc:
                     from vllm.distributed.utils import (
                         stateless_init_torch_distributed_process_group,
                     )
-                    _coord_port = (
+                    import torch.distributed as dist
+                    from datetime import timedelta
+                    from vllm.utils.network_utils import get_ip
+
+                    # The gloo coord group's TCP rendezvous needs a host
+                    # reachable by ALL cloud DPs. ``master_addr`` points to
+                    # the edge (not a cloud node) and the cloud DPs do not
+                    # know each other's IP a priori, so:
+                    #   * Edge DP0 hosts a tiny IP-exchange store
+                    #     (master_port + 200); see patch_engine_core.py.
+                    #   * Cloud DP0 (gloo rank 0 / store master) publishes
+                    #     its own ``get_ip()`` there and binds the gloo
+                    #     store on that IP (master_port + 201).
+                    #   * Cloud DP1+ read DP0's IP from the exchange store
+                    #     and connect to it.
+                    # The old ``host="127.0.0.1"`` only worked when both
+                    # cloud DPs were colocated on one machine: rank 1 on a
+                    # different host connected to its own loopback, so the
+                    # rendezvous never completed (hang in _create_c10d_store).
+                    _ip_exchange_port = (
                         vllm_config.parallel_config.master_port + 200
                     )
-                    # Both cloud PassiveEngineCore processes are colocated
-                    # on the same cloud machine — use localhost for the
-                    # TCP rendezvous.  master_addr / data_parallel_master_ip
-                    # points to the edge machine, which has no gloo server
-                    # on this port.
+                    _gloo_coord_port = (
+                        vllm_config.parallel_config.master_port + 201
+                    )
+                    _my_ip = get_ip()
+                    # wait_for_workers=False: connect without blocking on a
+                    # world_size barrier; sync is purely set/get-based
+                    # (get blocks until DP0 sets the key, mirroring the
+                    # existing cloud_ip handshake).
+                    _ip_store = dist.TCPStore(
+                        host_name=master_addr,
+                        port=_ip_exchange_port,
+                        world_size=_dp_size,
+                        is_master=False,
+                        wait_for_workers=False,
+                        timeout=timedelta(seconds=300),
+                    )
+                    if _dp_rank == 0:
+                        _ip_store.set("coord_master_ip", _my_ip)
+                        _coord_host = _my_ip
+                    else:
+                        _coord_host = _ip_store.get(
+                            "coord_master_ip"
+                        ).decode()
+                    logger.info(
+                        "Cloud cross-DP coord rendezvous: dp_rank=%s/%s "
+                        "ip_exchange=%s:%s gloo_host=%s gloo_port=%s",
+                        _dp_rank, _dp_size, master_addr, _ip_exchange_port,
+                        _coord_host, _gloo_coord_port,
+                    )
                     dp_coord_group = (
                         stateless_init_torch_distributed_process_group(
-                            host="127.0.0.1",
-                            port=_coord_port,
+                            host=_coord_host,
+                            port=_gloo_coord_port,
                             rank=_dp_rank,
                             world_size=_dp_size,
                             backend="gloo",
@@ -1037,7 +1080,7 @@ class PassiveEngineCoreProc:
                     logger.info(
                         "Cloud cross-DP coord group created: "
                         "dp_rank=%s/%s port=%s",
-                        _dp_rank, _dp_size, _coord_port,
+                        _dp_rank, _dp_size, _gloo_coord_port,
                     )
                 # -------------------------------------------------------
 

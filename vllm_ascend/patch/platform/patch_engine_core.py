@@ -131,6 +131,36 @@ def _patched_engine_core_init(self, *args, **kwargs):
     self._pp_pd_channel = None
     if pd_enabled and getattr(parallel_config, "is_edge_node", False):
         dp_rank = getattr(parallel_config, "data_parallel_rank", 0)
+        import torch.distributed as dist
+        from datetime import timedelta
+
+        # Cloud cross-DP coord group: edge DP0 hosts a tiny IP-exchange
+        # store so cloud DP1+ can discover cloud DP0's reachable IP (cloud
+        # DP0 is the gloo rank-0 / store master). Hosted with
+        # wait_for_workers=False so the constructor returns immediately
+        # (no barrier, no blocking on cloud startup); kept alive on `self`
+        # for the process lifetime. Clouds set/get ``coord_master_ip``
+        # during their coord-group init. See passive_core.py
+        # run_passive_engine_core for the client side.
+        _dp_size = getattr(parallel_config, "data_parallel_size", 1)
+        _is_moe = bool(
+            getattr(self.vllm_config.model_config, "is_moe", False)
+        )
+        if dp_rank == 0 and _dp_size > 1 and _is_moe:
+            self._cloud_coord_ip_store = dist.TCPStore(
+                host_name=parallel_config.master_addr,
+                port=parallel_config.master_port + 200,
+                world_size=_dp_size,
+                is_master=True,
+                wait_for_workers=False,
+                timeout=timedelta(seconds=300),
+            )
+            logger.info(
+                "Edge DP0 hosting cloud-coord IP-exchange store on "
+                "%s:%s",
+                parallel_config.master_addr,
+                parallel_config.master_port + 200,
+            )
 
         # Discover the cloud's IP via a one-shot TCPStore. The edge
         # acts as store master on ``master_port + 1 + dp_rank`` so
@@ -138,8 +168,6 @@ def _patched_engine_core_init(self, *args, **kwargs):
         # The cloud connects once per edge DP rank and writes its
         # ``get_ip()`` result. See passive_core.py for the
         # symmetric writer side.
-        import torch.distributed as dist
-        from datetime import timedelta
         _addr_store = dist.TCPStore(
             host_name=parallel_config.master_addr,
             port=parallel_config.master_port + 1 + dp_rank,
