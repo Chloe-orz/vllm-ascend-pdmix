@@ -230,17 +230,14 @@ def _deepseek_v4_mtp_predictor_forward_edge_cloud_segment(
         raise RuntimeError(
             "DeepSeek-V4 MTP segment C cannot execute a missing mtp_block"
         )
-    hidden_states, residual = layer.mtp_block(
+    hidden_states, _ = layer.mtp_block(
         positions=positions,
         hidden_states=hidden_states,
         residual=None,
     )
-    return IntermediateTensors(
-        {
-            "hidden_states": hidden_states,
-            "residual": residual,
-        }
-    )
+    # The edge-side hc_head consumes decoder hidden states directly. Avoid
+    # sending the unused residual back across the edge-cloud boundary.
+    return IntermediateTensors({"hidden_states": hidden_states})
 
 
 def _deepseek_v4_mtp_forward_edge_cloud_segment(
