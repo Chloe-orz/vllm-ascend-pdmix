@@ -1230,6 +1230,92 @@ class NPUModelRunner(GPUModelRunner):
             )
             hidden_states.copy_(fused_hidden_states)
 
+    @staticmethod
+    def _merge_eagle3_cloud_aux_hidden_states(
+        previous: torch.Tensor | None,
+        current: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Append auxiliary target states produced by one layer slice.
+
+        A sliced target forward only returns the Eagle3 auxiliary layers that
+        fall inside the current slice.  Keep the feature dimension in global
+        layer order as slices execute from low to high layer indices.
+        """
+        if current is None:
+            return previous
+        if not torch.is_tensor(current):
+            raise RuntimeError(
+                "EAGLE3 cloud aux_hidden_states must be a tensor, got "
+                f"{type(current).__name__}"
+            )
+        if previous is None:
+            # Segment outputs may point at reusable graph/input buffers.
+            return _freeze_scheduled_state(current)
+        if (
+            previous.ndim != current.ndim
+            or previous.shape[:-1] != current.shape[:-1]
+        ):
+            raise RuntimeError(
+                "EAGLE3 cloud layer slices produced incompatible auxiliary "
+                f"hidden-state shapes: {previous.shape} vs {current.shape}"
+            )
+        # torch.cat copies ``current`` out of the reusable segment output, so
+        # no extra clone is needed once at least one frozen part exists.
+        return torch.cat((previous, current), dim=-1)
+
+    def _cache_eagle3_cloud_aux_hidden_states(
+        self,
+        aux_hidden_states: torch.Tensor | None,
+        layer_slice_info: Any,
+    ) -> None:
+        """Cache complete target auxiliary states for the matching draft.
+
+        The first slice starts a new accumulator.  Continuation slices must
+        use ``_layerwise_scheduler_output``: an interleaved decode may have
+        replaced ``_last_scheduler_output`` since slice 0 ran.
+        """
+        is_first_slice = (
+            layer_slice_info is None or layer_slice_info.is_first_slice
+        )
+        scheduler_output = (
+            self._layerwise_scheduler_output
+            if layer_slice_info is not None
+            else self._last_scheduler_output
+        )
+        task_id = (
+            scheduler_output.head_token
+            if scheduler_output is not None
+            else None
+        )
+        use_task_cache = bool(
+            self._uses_scheduled_edge_cloud_draft()
+            and self.speculative_config.method == "eagle3"
+            and task_id is not None
+        )
+
+        if use_task_cache:
+            assert task_id is not None
+            if is_first_slice:
+                self._eagle3_cloud_aux_hidden_states_by_task.pop(
+                    task_id, None
+                )
+            previous = self._eagle3_cloud_aux_hidden_states_by_task.get(
+                task_id
+            )
+        else:
+            previous = (
+                None
+                if is_first_slice
+                else self._eagle3_cloud_aux_hidden_states
+            )
+
+        merged = self._merge_eagle3_cloud_aux_hidden_states(
+            previous, aux_hidden_states
+        )
+        self._eagle3_cloud_aux_hidden_states = merged
+        if use_task_cache and merged is not None:
+            self._eagle3_cloud_aux_hidden_states_by_task[task_id] = merged
+
     def _load_model_edge_cloud(self) -> None:
         """边云场景的模型加载流程（复用 vLLM 标准 PP 初始化，直接加载到 NPU）。
 
@@ -6703,19 +6789,11 @@ class NPUModelRunner(GPUModelRunner):
         # cloud side and remove them from the tensors sent back to the edge.
         # Build a new IntermediateTensors instead of mutating the returned one,
         # because the returned object may be reused by ACL graph replay.
-        if "aux_hidden_states" in hidden_states.tensors:
-            aux_hidden_states = hidden_states.tensors["aux_hidden_states"]
-            self._eagle3_cloud_aux_hidden_states = aux_hidden_states
-            scheduler_output = self._last_scheduler_output
-            if (
-                self._uses_scheduled_edge_cloud_draft()
-                and self.speculative_config.method == "eagle3"
-                and scheduler_output is not None
-                and scheduler_output.head_token is not None
-            ):
-                self._eagle3_cloud_aux_hidden_states_by_task[
-                    scheduler_output.head_token
-                ] = _freeze_scheduled_state(aux_hidden_states)
+        aux_hidden_states = hidden_states.tensors.get("aux_hidden_states")
+        self._cache_eagle3_cloud_aux_hidden_states(
+            aux_hidden_states, layer_slice_info
+        )
+        if aux_hidden_states is not None:
             return IntermediateTensors(
                 {
                     k: v
@@ -6723,7 +6801,6 @@ class NPUModelRunner(GPUModelRunner):
                     if k != "aux_hidden_states"
                 }
             )
-        self._eagle3_cloud_aux_hidden_states = None
         return hidden_states
 
     def _pad_for_sequence_parallelism(
