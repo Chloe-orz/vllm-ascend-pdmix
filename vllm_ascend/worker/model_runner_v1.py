@@ -561,7 +561,9 @@ class NPUModelRunner(GPUModelRunner):
                     "edge_cloud_config.edge_head_tail_layers=[3, 1]."
                 )
             self._is_qwen3_5 = "qwen3_5" in model_type
-            self._is_deepseek_v2 = "deepseek" in model_type
+            self._is_deepseek_v2 = (
+                "deepseek" in model_type and not self._is_deepseek_v4
+            )
             self._is_kimi_k25 = "kimi_k25" in outer_model_type or "kimi_k25" in model_type
             self._is_glm4_moe = "glm4_moe" in model_type or "glm_moe_dsa" in model_type
             self._is_minimax_m2 = "minimax_m2" in model_type
@@ -888,7 +890,9 @@ class NPUModelRunner(GPUModelRunner):
                     "edge_cloud_config.edge_head_tail_layers=[3, 1]."
                 )
             self._is_qwen3_5 = "qwen3_5" in model_type
-            self._is_deepseek_v2 = "deepseek" in model_type
+            self._is_deepseek_v2 = (
+                "deepseek" in model_type and not self._is_deepseek_v4
+            )
             self._is_kimi_k25 = "kimi_k25" in outer_model_type or "kimi_k25" in model_type
             self._is_glm4_moe = "glm4_moe" in model_type or "glm_moe_dsa" in model_type
             self._is_minimax_m2 = "minimax_m2" in model_type
@@ -1187,11 +1191,18 @@ class NPUModelRunner(GPUModelRunner):
           2. get_model → BaseModelLoader.load_model（标准 NPU 上初始化+加载）
           3. 创建分段 callable 并按需包装 ACLGraphWrapper
         """
-        if not (self._is_qwen3_5 or self._is_deepseek_v2 or self._is_kimi_k25 
-                or self._is_glm4_moe or self._is_minimax_m2):
+        if not (
+            self._is_qwen3_5
+            or self._is_deepseek_v2
+            or self._is_deepseek_v4
+            or self._is_kimi_k25
+            or self._is_glm4_moe
+            or self._is_minimax_m2
+        ):
             raise NotImplementedError(
-                "edge-cloud mode currently supports Qwen3.5, DeepseekV2/V3, "
-                "Kimi-K2.5/K2.6, GLM-4/GLM-5 models, and MiniMax-M2 models."
+                "edge-cloud mode currently supports Qwen3.5, "
+                "DeepSeek-V2/V3/V4, Kimi-K2.5/K2.6, GLM-4/GLM-5 models, "
+                "and MiniMax-M2 models."
             )
 
         logger.info(
