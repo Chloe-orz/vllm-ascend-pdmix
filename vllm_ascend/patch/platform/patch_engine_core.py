@@ -207,25 +207,18 @@ def _drain_pd_channel_inbox(self) -> None:
 def _maybe_publish_pre_out(
     self, scheduler_output: SchedulerOutput
 ) -> None:
-    """Forward DECODE_FIRST batches on the edge → cloud channel immediately.
-
-    DECODE_FIRST is published synchronously at schedule time because its
-    cloud-side decode-middle segment must start as soon as possible to keep
-    the decode pipeline full.
-
-    PREFILL_FIRST is handled by _publish_pre_out_when_ready instead, which
-    delays the ZMQ notification until the prefill head segment becomes the
-    next batch to execute, preventing the cloud from blocking on irecv while
-    the edge prefill is still queued behind other batches.
-    """
+    """Forward head-segment batches on the edge → cloud channel."""
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt in (BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST):
+    if bt in (
+        BatchType.PREFILL_FIRST,
+        BatchType.DECODE_FIRST,
+        BatchType.DRAFT_FIRST,
+    ):
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
-        BatchType.PREFILL_FIRST,
         BatchType.PREFILL_LAST,
         BatchType.DECODE_LAST,
         BatchType.DRAFT_LAST,
@@ -249,62 +242,6 @@ def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
         return
     if not scheduler_output.head_token:
         scheduler_output.head_token = uuid4().hex
-
-
-def _publish_pre_out_when_ready(self) -> None:
-    """Publish the oldest PREFILL_FIRST batch in batch_queue only when it
-    becomes the next batch to execute (rightmost in the deque).
-
-    This delays the ZMQ PRE_OUT notification for prefill head segments until
-    the edge worker is about to actually execute them, preventing the cloud
-    from blocking on irecv while the edge prefill head segment is still
-    queued behind other batches.
-    """
-    ch = getattr(self, "_pp_pd_channel", None)
-    if ch is None:
-        return
-
-    batch_queue = self.batch_queue
-    if not batch_queue:
-        return
-
-    _, oldest_so, _ = batch_queue[-1]
-    if oldest_so.batch_type not in (
-        BatchType.PREFILL_FIRST,
-        BatchType.DRAFT_FIRST,
-    ):
-        return
-
-    head_token = getattr(oldest_so, "head_token", None)
-    if not head_token:
-        return
-
-    published = getattr(self, "_published_pre_out_tokens", None)
-    if published is None:
-        published = set()
-        self._published_pre_out_tokens = published
-    if head_token in published:
-        return
-
-    ch.publish(oldest_so)
-    published.add(head_token)
-    logger.info(
-        "[PRE_OUT] Published %s (head_token=%s) when it became next to execute, "
-        "queue_len=%d",
-        oldest_so.batch_type.value,
-        head_token, len(batch_queue),
-    )
-
-
-def _clear_published_pre_out_token(self, scheduler_output: SchedulerOutput) -> None:
-    """Remove the head_token from published set after the batch completes,
-    preventing unbounded growth of the set."""
-    head_token = getattr(scheduler_output, "head_token", None)
-    if not head_token:
-        return
-    published = getattr(self, "_published_pre_out_tokens", None)
-    if published is not None:
-        published.discard(head_token)
 
 
 def _needs_sample_tokens(self, scheduler_output: SchedulerOutput) -> bool:
@@ -577,11 +514,8 @@ def _patched_step_with_batch_queue(self):
         # state.
         self._ensure_pd_head_token(scheduler_output)
 
-        # [ascend insert] DECODE_FIRST is published immediately to keep the
-        # decode pipeline full; PREFILL_FIRST is delayed via
-        # _publish_pre_out_when_ready until it becomes next to execute.
-        if scheduler_output.batch_type == BatchType.DECODE_FIRST:
-            self._maybe_publish_pre_out(scheduler_output)
+        # [ascend insert] Forward head-segment batches on PRE_OUT.
+        self._maybe_publish_pre_out(scheduler_output)
 
         if scheduler_output.batch_type == BatchType.EMPTY:
             if batch_queue:
@@ -646,13 +580,7 @@ def _patched_step_with_batch_queue(self):
         return None, False
 
     # Block until the next result is available.
-    # [ascend insert] Publish PRE_OUT for the head segment that is about
-    # to execute (rightmost in deque).  FIFO guarantees every PREFILL_FIRST
-    # eventually becomes batch_queue[-1] before pop().
-    self._publish_pre_out_when_ready()
     future, scheduler_output, exec_model_fut = batch_queue.pop()
-    # [ascend insert] Clean up PRE_OUT tracking for completed batch.
-    self._clear_published_pre_out_token(scheduler_output)
     bt = scheduler_output.batch_type
     vllm_logger.info(
         "[PD] EngineCore blocking on future.result(): "
@@ -820,8 +748,6 @@ def install() -> None:
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
     EngineCore._ensure_pd_head_token = _ensure_pd_head_token
-    EngineCore._publish_pre_out_when_ready = _publish_pre_out_when_ready
-    EngineCore._clear_published_pre_out_token = _clear_published_pre_out_token
     EngineCore._needs_sample_tokens = _needs_sample_tokens
     EngineCore._stash_empty_worker_cleanup = _stash_empty_worker_cleanup
     EngineCore._merge_pending_worker_cleanup = _merge_pending_worker_cleanup
