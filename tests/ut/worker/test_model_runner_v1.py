@@ -35,6 +35,75 @@ class TestNPUModelRunnerLayerwiseAuxOutput(unittest.TestCase):
 
         self.assertIs(result, hidden_states)
 
+    def test_accumulates_eagle3_aux_states_across_layer_slices(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._eagle3_cloud_aux_hidden_states = None
+        runner._eagle3_cloud_aux_hidden_states_by_task = {}
+        runner._uses_scheduled_edge_cloud_draft = MagicMock(return_value=True)
+        runner.speculative_config = SimpleNamespace(method="eagle3")
+        runner._last_scheduler_output = SimpleNamespace(
+            head_token="interleaved-decode"
+        )
+        runner._layerwise_scheduler_output = SimpleNamespace(
+            head_token="sliced-target"
+        )
+        first_slice = SimpleNamespace(is_first_slice=True)
+        middle_slice = SimpleNamespace(is_first_slice=False)
+        first_aux = torch.randn(2, 4)
+        last_aux = torch.randn(2, 8)
+
+        runner._cache_eagle3_cloud_aux_hidden_states(
+            first_aux, first_slice
+        )
+        # Slices that contain no configured Eagle3 layer must preserve the
+        # parts collected by earlier slices.
+        runner._cache_eagle3_cloud_aux_hidden_states(None, middle_slice)
+        runner._cache_eagle3_cloud_aux_hidden_states(
+            last_aux, middle_slice
+        )
+
+        expected = torch.cat((first_aux, last_aux), dim=-1)
+        actual = runner._eagle3_cloud_aux_hidden_states_by_task[
+            "sliced-target"
+        ]
+        torch.testing.assert_close(actual, expected)
+        self.assertNotIn(
+            "interleaved-decode",
+            runner._eagle3_cloud_aux_hidden_states_by_task,
+        )
+
+    def test_first_layer_slice_resets_eagle3_aux_accumulator(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._eagle3_cloud_aux_hidden_states = None
+        runner._eagle3_cloud_aux_hidden_states_by_task = {
+            "sliced-target": torch.randn(2, 12)
+        }
+        runner._uses_scheduled_edge_cloud_draft = MagicMock(return_value=True)
+        runner.speculative_config = SimpleNamespace(method="eagle3")
+        runner._last_scheduler_output = None
+        runner._layerwise_scheduler_output = SimpleNamespace(
+            head_token="sliced-target"
+        )
+        new_aux = torch.randn(2, 4)
+
+        runner._cache_eagle3_cloud_aux_hidden_states(
+            new_aux, SimpleNamespace(is_first_slice=True)
+        )
+
+        actual = runner._eagle3_cloud_aux_hidden_states_by_task[
+            "sliced-target"
+        ]
+        torch.testing.assert_close(actual, new_aux)
+        self.assertIsNot(actual, new_aux)
+
+    def test_rejects_mismatched_eagle3_aux_slice_shapes(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "incompatible auxiliary hidden-state shapes"
+        ):
+            NPUModelRunner._merge_eagle3_cloud_aux_hidden_states(
+                torch.randn(2, 4), torch.randn(3, 4)
+            )
+
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
