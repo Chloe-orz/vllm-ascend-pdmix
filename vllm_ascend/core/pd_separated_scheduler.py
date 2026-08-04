@@ -1192,26 +1192,26 @@ class PDSeparatedScheduler(Scheduler):
         return scheduler_output
 
     def _pick_draft_last_batch(self) -> SchedulerOutput:
-        while self.drafts_last_ready:
-            scheduler_output = self.drafts_last_ready.popleft()
-            if scheduler_output.batch_type != BatchType.DRAFT_LAST:
-                raise RuntimeError(
-                    "drafts_last_ready expects DRAFT_LAST, got "
-                    f"{scheduler_output.batch_type}"
-                )
-            self._validate_draft_tail_channel(scheduler_output)
-            if self._is_stale_draft_output(scheduler_output):
-                self.draft_remote_pending_count = max(
-                    0, self.draft_remote_pending_count - 1
-                )
-                logger.info(
-                    "[PD] drop stale DRAFT_LAST task_id=%s step=%s",
-                    scheduler_output.draft_task_id,
-                    scheduler_output.draft_step_idx,
-                )
-                continue
-            return scheduler_output
-        return self._make_empty_batch()
+        if not self.drafts_last_ready:
+            return self._make_empty_batch()
+        scheduler_output = self.drafts_last_ready.popleft()
+        if scheduler_output.batch_type != BatchType.DRAFT_LAST:
+            raise RuntimeError(
+                "drafts_last_ready expects DRAFT_LAST, got "
+                f"{scheduler_output.batch_type}"
+            )
+        self._validate_draft_tail_channel(scheduler_output)
+        # DRAFT_FIRST has already been dispatched to the cloud, so the cloud
+        # will send this response even when every owning request has finished.
+        # Always execute the tail receive to keep the shared DECODE channel
+        # paired; the worker skips tail compute when its context is gone.
+        if self._is_stale_draft_output(scheduler_output):
+            logger.info(
+                "[PD] drain stale DRAFT_LAST task_id=%s step=%s",
+                scheduler_output.draft_task_id,
+                scheduler_output.draft_step_idx,
+            )
+        return scheduler_output
 
     @staticmethod
     def _scheduler_output_intersects_req_ids(
@@ -1227,22 +1227,28 @@ class PDSeparatedScheduler(Scheduler):
     def _drop_stale_drafts_for_req_ids(self, req_ids: set[str]) -> None:
         if not req_ids:
             return
+        # A scheduled draft context is batch-scoped. If only one member of a
+        # concurrent batch finishes, keep the draft for the remaining live
+        # requests; the cloud metadata cannot be safely re-sliced per request.
         self.drafts_first_ready = deque(
             output
             for output in self.drafts_first_ready
-            if not self._scheduler_output_intersects_req_ids(output, req_ids)
+            if not (
+                self._scheduler_output_intersects_req_ids(output, req_ids)
+                and self._is_stale_draft_output(output)
+            )
         )
-        kept_last: deque[SchedulerOutput] = deque()
-        dropped_last = 0
+        # Never drop an already queued DRAFT_LAST. Its DRAFT_FIRST has already
+        # reached the cloud, which will still send a response without knowing
+        # that the edge-side request has finished. Dropping the receive here
+        # leaves the shared DECODE channel permanently out of sync.
         for output in self.drafts_last_ready:
             if self._scheduler_output_intersects_req_ids(output, req_ids):
-                dropped_last += 1
-            else:
-                kept_last.append(output)
-        self.drafts_last_ready = kept_last
-        self.draft_remote_pending_count = max(
-            0, self.draft_remote_pending_count - dropped_last
-        )
+                logger.info(
+                    "[PD] keep DRAFT_LAST task_id=%s step=%s for drain",
+                    output.draft_task_id,
+                    output.draft_step_idx,
+                )
 
     def _is_stale_draft_output(
         self, scheduler_output: SchedulerOutput

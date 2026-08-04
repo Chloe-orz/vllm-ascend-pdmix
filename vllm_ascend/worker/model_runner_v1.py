@@ -825,7 +825,10 @@ class NPUModelRunner(GPUModelRunner):
         self._cloud_spec_decode_metadata_by_task: dict[
             str, tuple[AscendCommonAttentionMetadata, int]
         ] = {}
-        self._cloud_spec_decode_metadata_cache_max: int = 8
+        # Multi-request draft chains can legitimately lag several verify
+        # steps. Evicting an in-flight task prevents the cloud from producing
+        # its matching DRAFT_LAST and leaves the edge blocked in recv.
+        self._cloud_spec_decode_metadata_cache_max: int = 32
         # Same per-task treatment for the verify step's scheduler_output:
         # the independently scheduled draft task applies the
         # num_accepted / mamba state correction, and by then
@@ -2949,13 +2952,25 @@ class NPUModelRunner(GPUModelRunner):
         self, req_ids: set[str] | list[str]
     ) -> None:
         req_id_set = set(req_ids)
-        stale_task_ids = [
-            task_id
-            for task_id, context in (
-                self._pending_edge_cloud_draft_contexts.items()
+        stale_task_ids: list[str] = []
+        for task_id, context in list(
+            self._pending_edge_cloud_draft_contexts.items()
+        ):
+            context_req_ids = tuple(context.get("req_ids") or ())
+            finished_req_ids = context.setdefault("finished_req_ids", set())
+            finished_req_ids.update(
+                req_id_set.intersection(context_req_ids)
             )
-            if req_id_set.intersection(context.get("req_ids") or ())
-        ]
+            # Draft attention metadata and hidden states are batch-scoped.
+            # Preserve the context while at least one request in the batch is
+            # still live; update_draft_token_ids later ignores finished rows.
+            if context_req_ids and not all(
+                req_id in finished_req_ids for req_id in context_req_ids
+            ):
+                continue
+            if context_req_ids:
+                stale_task_ids.append(task_id)
+
         for task_id in stale_task_ids:
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
         if stale_task_ids:
@@ -3172,9 +3187,27 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors,
     ) -> ModelRunnerOutput:
-        context = self._get_pending_edge_cloud_draft_context(
-            scheduler_output
+        task_id = scheduler_output.draft_task_id
+        context = (
+            self._pending_edge_cloud_draft_contexts.get(task_id)
+            if task_id else None
         )
+        if context is None:
+            # The receive in _execute_model_edge_draft_tail has already
+            # consumed the cloud response. If the request ended meanwhile,
+            # there is no local tail context left and no useful computation to
+            # run; return a token-less output after draining the channel.
+            logger.info(
+                "[PD] drain stale DRAFT_LAST task_id=%s step=%s "
+                "(request gone, draft context cleared)",
+                task_id,
+                scheduler_output.draft_step_idx,
+            )
+            req_ids = list(scheduler_output.num_scheduled_tokens)
+            return ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            )
         draft_step_idx = int(scheduler_output.draft_step_idx or 0)
         positions = context.get("current_draft_positions")
         if positions is None:
