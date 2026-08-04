@@ -727,7 +727,7 @@ class PassiveEngineCoreProc:
             # [SLICE-DIAG] Log cloud enqueue with slice info.
             _tokens = batch.scheduler_output.total_num_scheduled_tokens
             _si = slice_info
-            logger.error(
+            logger.info(
                 "[SLICE-DIAG] cloud step enqueue: tokens=%s slices=%s "
                 "slice_info=%s is_first=%s is_last=%s start=%s end=%s total=%s",
                 _tokens,

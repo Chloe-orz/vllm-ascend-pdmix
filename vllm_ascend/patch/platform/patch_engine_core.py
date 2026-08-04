@@ -810,8 +810,8 @@ def _coordinate_bt(
     _winner = _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
     # Throttle: log every 32 calls and whenever real work is coordinated.
     if _cnt % 32 == 0 or winner_id != 0:
-        logger.error(
-            "[DPDBG][COORD] dp_rank=%s count=%s intended=%s winner=%s "
+        logger.info(
+            "[COORD] dp_rank=%s count=%s intended=%s winner=%s "
             "engines_running=%s bt_ids=%s waitings=%s",
             dp_rank, _cnt,
             _BT_COORD_ID.get(intended_bt, 0), _BT_COORD_ID.get(_winner, 0),
@@ -1065,11 +1065,11 @@ def _patched_step_with_batch_queue(self):
             _coord_winner, _coord_engines_running = self._coordinate_bt(
                 _intended_batch_type, _local_has_work, _has_work_waiting
             )
-            vllm_logger.error(f"step_cnt={self.step_cnt} _coord_winner={_coord_winner} _intended_batch_type={_intended_batch_type}")
+            vllm_logger.info(f"step_cnt={self.step_cnt} _coord_winner={_coord_winner} _intended_batch_type={_intended_batch_type}")
             self._coord_engines_running = _coord_engines_running
             _cnt = getattr(self, "_coord_bt_count", 0)
             if _local_has_work or _cnt % 32 == 0:
-                vllm_logger.error(
+                vllm_logger.info(
                     "[DPDBG][COORD-IN] dp_rank=%s has_requests=%s has_unfinished=%s "
                     "batch_queue=%s local_has_work=%s winner=%s engines_running=%s",
                     self.vllm_config.parallel_config.data_parallel_rank,
@@ -1329,7 +1329,7 @@ def _patched_process_input_queue(self):
     """Exits when an engine step needs to be performed."""
     waited = False
     _piq_rank = getattr(self, "dp_rank", "?")
-    logger.error(
+    logger.info(
         "[HANG] _process_input_queue ENTER: dp_rank=%s has_work=%s has_unfinished=%s "
         "batch_queue=%s engines_running=%s input_empty=%s",
         _piq_rank, self.has_work(), self.scheduler.has_unfinished_requests(),
@@ -1361,7 +1361,7 @@ def _patched_process_input_queue(self):
         ):
             block = True
 
-        logger.error(
+        logger.info(
             "[HANG] _process_input_queue WAIT: dp_rank=%s has_unfinished=%s "
             "batch_queue=%s engines_running=%s block=%s input_empty=%s",
             _piq_rank, self.scheduler.has_unfinished_requests(),

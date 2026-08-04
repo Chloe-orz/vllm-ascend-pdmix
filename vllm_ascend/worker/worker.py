@@ -966,7 +966,7 @@ class NPUWorker(WorkerBase):
                                             num_tokens=scheduler_output.total_num_scheduled_tokens),
                 channel=channel,
             )
-            logger.error(
+            logger.info(
                 "[PP-EVT] SEND dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
                 self.model_runner.dp_rank,
                 scheduler_output.batch_type.value,
@@ -1021,7 +1021,7 @@ class NPUWorker(WorkerBase):
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         channel = self._hidden_channel_for(scheduler_output)
         _hang_tail_rank = getattr(self.model_runner, "dp_rank", "?")
-        logger.error("[HANG] edge tail recv ENTER: dp_rank=%s channel=%s batch_type=%s",
+        logger.info("[HANG] edge tail recv ENTER: dp_rank=%s channel=%s batch_type=%s",
                     _hang_tail_rank, channel.value, scheduler_output.batch_type)
         import sys as _hang_sys
         _hang_sys.stderr.flush()
@@ -1030,10 +1030,10 @@ class NPUWorker(WorkerBase):
             channel=channel,
             sp_chunk=edge_sp and edge_merge,
         )
-        logger.error("[HANG] edge tail recv EXIT: dp_rank=%s channel=%s",
+        logger.info("[HANG] edge tail recv EXIT: dp_rank=%s channel=%s",
                     _hang_tail_rank, channel.value)
         _hang_sys.stderr.flush()
-        logger.error(
+        logger.info(
             "[PP-EVT] RECV dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
             _hang_tail_rank, scheduler_output.batch_type.value,
             getattr(scheduler_output, "head_token", "?"),
@@ -1713,7 +1713,7 @@ class NPUWorker(WorkerBase):
         # with large real KV values. Prefill-style attention is causal (only
         # writes KV, doesn't read), avoiding the NaN.
         _lsi = layer_slice_info
-        logger.error(
+        logger.info(
             "[SLICE-DIAG] execute_dummy_batch entry: layer_slice_info=%s "
             "is_first=%s is_last=%s start=%s end=%s total=%s",
             type(_lsi).__name__ if _lsi is not None else "None",

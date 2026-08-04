@@ -1706,8 +1706,8 @@ class NPUModelRunner(GPUModelRunner):
             _sm_rank = dist.get_rank()
         except Exception:
             _sm_rank = -1
-        logger.error(
-            "[PP-EVT][DPDBG] sync_meta: rank=%s dp_rank=%s call=%s my_bt=%s peer_bt=%s "
+        logger.info(
+            "[PP-EVT] sync_meta: rank=%s dp_rank=%s call=%s my_bt=%s peer_bt=%s "
             "num_tokens=%s",
             _sm_rank, self.dp_rank, _smc, self._dp_batch_type_id,
             self._peer_batch_type_id, num_tokens,
@@ -3873,7 +3873,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
             )
-            logger.error(
+            logger.info(
                 "[DPDBG] tail_sync_meta: cached_ntp=%s so_tnst=%s ntad=%s",
                 num_tokens_padded,
                 scheduler_output.total_num_scheduled_tokens,
@@ -4212,7 +4212,7 @@ class NPUModelRunner(GPUModelRunner):
                     "cudagraph_stats": cudagraph_stats,
                     "total_num_scheduled_tokens": total_num_scheduled_tokens,
                 }
-            logger.error(
+            logger.info(
                 "[DPDBG] head_cache: tnst=%s ntad=%s ntp=%s",
                 total_num_scheduled_tokens, num_tokens_across_dp, num_tokens_padded,
             )
@@ -7339,7 +7339,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # [SLICE-DIAG] Log whether _dummy_run receives layer_slice_info.
         _lsi = layer_slice_info
-        logger.error(
+        logger.info(
             "[SLICE-DIAG] _dummy_run: layer_slice_info=%s "
             "is_first=%s is_last=%s start=%s end=%s total=%s "
             "num_tokens=%s uniform_decode=%s",
@@ -7594,7 +7594,7 @@ class NPUModelRunner(GPUModelRunner):
                         for _k, _v in intermediate_tensors.items():
                             _v.zero_()
                         _diag_hs = intermediate_tensors["hidden_states"]
-                        logger.error(
+                        logger.info(
                             "[PD-DIAG] D. cloud _dummy_run INPUT (intermediate_tensors): "
                             "shape=%s norm=%.6f mean=%.6f",
                             list(_diag_hs.shape),
@@ -7674,7 +7674,7 @@ class NPUModelRunner(GPUModelRunner):
                     # else: unmatched id - leave both False (run full forward)
                 # else (cloud, peer real): no skip - full middle forward pairs
                 # all-toall with the real cloud's middle.
-                logger.error(
+                logger.info(
                     "[DPDBG] _dummy_run: dp_rank=%s role=%s peer_bt=%s "
                     "skip_head=%s skip_tail=%s",
                     self.dp_rank,
@@ -7707,7 +7707,7 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         if not layer_slice_info.is_last_slice:
                             _model_kwargs["layer_slice_return_intermediate"] = True
-                    logger.error(
+                    logger.info(
                         "[MODEL-FWD] _dummy_run _model_forward: "
                         "layer_slice_info=%s",
                         None if layer_slice_info is None else {
@@ -7754,7 +7754,7 @@ class NPUModelRunner(GPUModelRunner):
                 # PD-separation diagnostic: log _dummy_run segment_a output
                 if not is_profile and not is_graph_capturing:
                     _has_nan = bool(torch.isnan(hidden_states).any().item()) if hasattr(hidden_states, 'shape') and hidden_states.dim() > 0 else '?'
-                    logger.error(
+                    logger.info(
                         "[PD-DIAG] E. _dummy_run segment_a OUTPUT: "
                         "shape=%s has_nan=%s",
                         list(hidden_states.shape) if hasattr(hidden_states, 'shape') else '?',
@@ -7836,7 +7836,7 @@ class NPUModelRunner(GPUModelRunner):
                 # PD-separation diagnostic: log _dummy_run segment_ee output
                 if not is_profile and not is_graph_capturing:
                     _has_nan = bool(torch.isnan(hidden_states).any().item()) if hasattr(hidden_states, 'shape') and hidden_states.dim() > 0 else '?'
-                    logger.error(
+                    logger.info(
                         "[PD-DIAG] E. _dummy_run segment_e OUTPUT: "
                         "shape=%s has_nan=%s",
                         list(hidden_states.shape) if hasattr(hidden_states, 'shape') else '?',
