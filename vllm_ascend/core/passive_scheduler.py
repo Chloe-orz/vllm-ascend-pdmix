@@ -607,7 +607,21 @@ class PassiveScheduler:
                 )
             return self._do_slice(so, total_slices)
 
-        # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
+        # 3. 协调模式下 pre-sync 了 >1 的切层意图（peer DP 有 decode 需求）
+        #    → 即使本地无 decode / cloud_suggest 也切层，否则 peer 的 real
+        #    prefill 会被本 DP 的 dummy（d_slices=0）强制不切。冷启动时意图=0，
+        #    此分支不命中，仍走下面的 no-slice。
+        if total_slices is not None and total_slices > 1:
+            if getattr(self, "_step", None):
+                logger.info(
+                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice "
+                    "(coordinated_total_slices=%d)",
+                    self._step, so.batch_type.value if so.batch_type else "?",
+                    total_slices,
+                )
+            return self._do_slice(so, total_slices)
+
+        # 4. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
         if getattr(self, "_step", None):
             logger.info(
@@ -943,20 +957,25 @@ class PassiveScheduler:
 
         _dp_rank = self.vllm_config.parallel_config.data_parallel_rank
 
-        # Pre-sync the prefill slice count across DPs *before* DP0 executes,
-        # so a dummy on DP0 (tokens==0 -> 1 slice) does not force DP1's real
-        # prefill unsliced via d_slices=0.  Each DP proposes the slice count
-        # its own ready_prefills head would need (dummy->1, real->N from
-        # layer_slice_config); all_reduce(MAX) makes both DPs slice by the
-        # real prefill's requirement.  _slice_for honors this on DP0; DP1
-        # follows via d_slices in _replay_by_deltas.
-        _local_slices = (
+        # Pre-sync the prefill slice *intent* across DPs *before* DP0
+        # executes.  Intent = resolve(head tokens) only when this DP has a
+        # decode demand (ready_decodes non-empty OR head cloud_suggest), else
+        # 0.  all_reduce(MAX) makes both DPs slice when *either* DP has decode
+        # demand, so a dummy on DP0 follows DP1's real prefill (which carries
+        # the cloud_suggest / decode signal); cold-start (no decode demand on
+        # either DP) -> intent 0 -> no slice.  _slice_for honors this on DP0;
+        # DP1 follows via d_slices in _replay_by_deltas.
+        _has_decode_demand = bool(self.ready_decodes) or (
+            bool(self.ready_prefills)
+            and getattr(self.ready_prefills[0], "cloud_suggest_slicing", False)
+        )
+        _local_intent = (
             self._resolve_slice_count(
                 self.ready_prefills[0].total_num_scheduled_tokens
             )
-            if self.ready_prefills else 0
+            if (self.ready_prefills and _has_decode_demand) else 0
         )
-        _sync = torch.tensor([_local_slices], dtype=torch.int32)
+        _sync = torch.tensor([_local_intent], dtype=torch.int32)
         dist.all_reduce(_sync, op=dist.ReduceOp.MAX,
                         group=self.dp_coord_group)
         self._coordinated_total_slices = int(_sync.item()) or None
