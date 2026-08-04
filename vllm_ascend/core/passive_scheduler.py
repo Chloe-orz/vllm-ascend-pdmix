@@ -573,11 +573,12 @@ class PassiveScheduler:
             return [None]
 
         # Coordinated mode pre-synced a slice count across DPs (see
-        # _schedule_expect_alternation).  Use it as the default so a dummy on
-        # this DP slices the same count as the peer's real prefill, keeping
-        # _active_prefill_slices lengths in sync (else DP1's real prefill is
-        # forced unsliced by DP0's dummy d_slices=0).  None outside
-        # coordinated mode → local decision below.
+        # _schedule_expect_alternation).  When slicing is warranted below
+        # (ready_decodes / cloud_suggest), use this synced count instead of
+        # the local so.tokens, so a dummy on DP0 slices the same N as DP1's
+        # real prefill (else dummy resolve(0)=1 → d_slices=0 → DP1 real
+        # unsliced).  No decode / no suggest still falls through to no-slice
+        # (cold-start: nothing to interleave).  None outside coordinated mode.
         if total_slices is None:
             total_slices = getattr(self, "_coordinated_total_slices", None)
 
@@ -606,20 +607,7 @@ class PassiveScheduler:
                 )
             return self._do_slice(so, total_slices)
 
-        # 3. 协调模式下 pre-sync 了 >1 的切层数（peer DP 有 real prefill）
-        #    → 即使本地无 decode / cloud_suggest 也切层，否则 peer 的 real
-        #    prefill 会被本 DP 的 dummy（d_slices=0）强制不切。
-        if total_slices is not None and total_slices > 1:
-            if getattr(self, "_step", None):
-                logger.info(
-                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice "
-                    "(coordinated_total_slices=%d)",
-                    self._step, so.batch_type.value if so.batch_type else "?",
-                    total_slices,
-                )
-            return self._do_slice(so, total_slices)
-
-        # 4. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
+        # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
         if getattr(self, "_step", None):
             logger.info(
