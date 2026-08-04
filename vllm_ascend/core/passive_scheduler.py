@@ -147,6 +147,13 @@ class PassiveScheduler:
         self._active_sliced_prefill: SchedulerOutput | None = None
         self._active_prefill_slices: deque[SliceTask] = deque()
 
+        # Coordinated mode: pre-synced total slice count for the
+        # ready_prefills head, aligned across DPs via all_reduce(MAX)
+        # before DP0 executes (see _schedule_expect_alternation).  Lets a
+        # dummy on one DP slice the same count as the peer's real prefill
+        # so d_slices stays in sync.  None outside coordinated mode.
+        self._coordinated_total_slices: int | None = None
+
         # Cloud-side P/D interleave guard. After dispatching one prefill-middle
         # slice, EXPECT_EXECUTE_DECODE_OR_DRAFT waits up to 10ms for a decode-middle
         # batch before falling back to another prefill-middle slice.
@@ -565,6 +572,15 @@ class PassiveScheduler:
                 )
             return [None]
 
+        # Coordinated mode pre-synced a slice count across DPs (see
+        # _schedule_expect_alternation).  Use it as the default so a dummy on
+        # this DP slices the same count as the peer's real prefill, keeping
+        # _active_prefill_slices lengths in sync (else DP1's real prefill is
+        # forced unsliced by DP0's dummy d_slices=0).  None outside
+        # coordinated mode → local decision below.
+        if total_slices is None:
+            total_slices = getattr(self, "_coordinated_total_slices", None)
+
         # [方案B] Cloud 侧决策：
         # 1. 已有 decode 到达 Cloud → 强制切层（确定性收益）
         if self.ready_decodes:
@@ -590,7 +606,20 @@ class PassiveScheduler:
                 )
             return self._do_slice(so, total_slices)
 
-        # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
+        # 3. 协调模式下 pre-sync 了 >1 的切层数（peer DP 有 real prefill）
+        #    → 即使本地无 decode / cloud_suggest 也切层，否则 peer 的 real
+        #    prefill 会被本 DP 的 dummy（d_slices=0）强制不切。
+        if total_slices is not None and total_slices > 1:
+            if getattr(self, "_step", None):
+                logger.info(
+                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice "
+                    "(coordinated_total_slices=%d)",
+                    self._step, so.batch_type.value if so.batch_type else "?",
+                    total_slices,
+                )
+            return self._do_slice(so, total_slices)
+
+        # 4. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
         if getattr(self, "_step", None):
             logger.info(
@@ -918,12 +947,31 @@ class PassiveScheduler:
           - DP1+ 根据差值 _replay_by_deltas 复刻执行。
         """
         if self.dp_coord_group is None or not self._is_coordinated_dp():
+            self._coordinated_total_slices = None
             return self._schedule_expect_alternation_simple()
 
         import torch
         import torch.distributed as dist
 
         _dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+
+        # Pre-sync the prefill slice count across DPs *before* DP0 executes,
+        # so a dummy on DP0 (tokens==0 -> 1 slice) does not force DP1's real
+        # prefill unsliced via d_slices=0.  Each DP proposes the slice count
+        # its own ready_prefills head would need (dummy->1, real->N from
+        # layer_slice_config); all_reduce(MAX) makes both DPs slice by the
+        # real prefill's requirement.  _slice_for honors this on DP0; DP1
+        # follows via d_slices in _replay_by_deltas.
+        _local_slices = (
+            self._resolve_slice_count(
+                self.ready_prefills[0].total_num_scheduled_tokens
+            )
+            if self.ready_prefills else 0
+        )
+        _sync = torch.tensor([_local_slices], dtype=torch.int32)
+        dist.all_reduce(_sync, op=dist.ReduceOp.MAX,
+                        group=self.dp_coord_group)
+        self._coordinated_total_slices = int(_sync.item()) or None
 
         if _dp_rank == 0:
             # --- DP0: 执行 + 记录 ---
