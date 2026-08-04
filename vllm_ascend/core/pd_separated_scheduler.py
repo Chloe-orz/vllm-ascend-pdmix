@@ -1073,10 +1073,16 @@ class PDSeparatedScheduler(Scheduler):
         so.batch_type = bt
         so.head_token = uuid4().hex
         self._assign_original_seq(so)
+        dp_rank = getattr(self.vllm_config.parallel_config,
+                           "data_parallel_rank", 0)
+        if not getattr(self.vllm_config.parallel_config,
+                       "is_shared_model_edge", False):
+            dp_rank = 0
         if bt in (BatchType.PREFILL_FIRST, BatchType.PREFILL_LAST):
-            so.hidden_channel = HiddenChannelType.PREFILL_1
+            prefill_channel_idx = dp_rank * _PREFILL_CHANNELS_PER_DP + 1
+            so.hidden_channel = HiddenChannelType.prefill(prefill_channel_idx)
         else:
-            so.hidden_channel = HiddenChannelType.DECODE
+            so.hidden_channel = HiddenChannelType.decode(dp_rank + 1)
         setattr(so, "is_pd_dummy", True)
         return so
 
