@@ -2753,6 +2753,27 @@ class NPUModelRunner(GPUModelRunner):
         model_type = str(getattr(hf_config, "model_type", "")).lower()
         return "qwen" in model_type or model_type == "deepseek_v4"
 
+    def _is_edge_cloud_mtp_edge_without_draft_kv(self) -> bool:
+        """Return whether this edge rank owns no MTP decoder KV cache.
+
+        Use the drafter's discovered attention layers as the source of truth
+        instead of assuming every edge-cloud MTP split is cloud-only. This
+        keeps startup correct if a future split places draft attention on edge.
+        """
+        is_edge_cloud_mtp_edge = bool(
+            self.speculative_config is not None
+            and getattr(self.speculative_config, "method", None) == "mtp"
+            and getattr(self, "_edge_cloud_enabled", False)
+            and getattr(self.edge_cloud_cfg, "role", None) == "edge"
+            and is_edge_device()
+            and self.drafter is not None
+        )
+        if not is_edge_cloud_mtp_edge:
+            return False
+
+        attn_layer_names = getattr(self.drafter, "attn_layer_names", None)
+        return attn_layer_names is not None and not attn_layer_names
+
     def _should_defer_edge_cloud_draft(
         self, scheduler_output: "SchedulerOutput"
     ) -> bool:
@@ -7080,7 +7101,10 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter:
+            if (
+                self.drafter
+                and not self._is_edge_cloud_mtp_edge_without_draft_kv()
+            ):
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -7391,10 +7415,14 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
-            skip_edge_drafter_attn_init = (
+            is_edge_cloud_eagle3_edge = (
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role == "edge"
-                and self.speculative_config.method in ("mtp", "eagle3")
+                and self.speculative_config.method == "eagle3"
+            )
+            skip_edge_drafter_attn_init = (
+                is_edge_cloud_eagle3_edge
+                or self._is_edge_cloud_mtp_edge_without_draft_kv()
             )
             if skip_edge_drafter_attn_init:
                 # All draft decoder layers run on the cloud. Their stale
