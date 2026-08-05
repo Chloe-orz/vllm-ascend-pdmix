@@ -401,11 +401,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 logger.warning("Target model has no accessible lm_head for sharing.")
 
-        is_deepseek_v4_edge_draft = (
+        is_deepseek_v4_edge_cloud_draft = (
             self.method == "mtp"
             and self.runner is not None
             and getattr(self.runner, "_edge_cloud_enabled", False)
-            and self.runner.edge_cloud_cfg.role == "edge"
             and getattr(
                 self.model,
                 "edge_cloud_draft_kind",
@@ -413,24 +412,33 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
             == "deepseek_v4_mtp"
         )
-        if is_deepseek_v4_edge_draft:
-            target_lm_head = getattr(model, "lm_head", None)
-            if target_lm_head is None or isinstance(
-                target_lm_head,
-                PPMissingLayer,
-            ):
-                raise RuntimeError(
-                    "DeepSeek-V4 MTP edge draft requires the target lm_head "
-                    "on the edge"
+        if is_deepseek_v4_edge_cloud_draft:
+            if self.runner.edge_cloud_cfg.role == "edge":
+                target_lm_head = getattr(model, "lm_head", None)
+                if target_lm_head is None or isinstance(
+                    target_lm_head,
+                    PPMissingLayer,
+                ):
+                    raise RuntimeError(
+                        "DeepSeek-V4 MTP edge draft requires the target "
+                        "lm_head on the edge"
+                    )
+                for layer_module in self.model.model.layers.values():
+                    if isinstance(layer_module, PPMissingLayer):
+                        continue
+                    layer_module.shared_head.head = target_lm_head
+                logger.info(
+                    "[EdgeCloud] DeepSeek-V4 MTP shares the target lm_head "
+                    "on the edge."
                 )
-            for layer_module in self.model.model.layers.values():
-                if isinstance(layer_module, PPMissingLayer):
-                    continue
-                layer_module.shared_head.head = target_lm_head
-            logger.info(
-                "[EdgeCloud] DeepSeek-V4 MTP shares the target lm_head on "
-                "the edge."
-            )
+            else:
+                # The cloud owns only the MTP decoder block. Its target
+                # lm_head and draft shared_head are intentionally replaced by
+                # PPMissingLayer, so there is nothing to share on this role.
+                logger.info(
+                    "[EdgeCloud] Skip DeepSeek-V4 MTP lm_head sharing on "
+                    "the cloud."
+                )
         elif (
             self.method == "mtp"
             and self.vllm_config.model_config.is_deepseek_mla
