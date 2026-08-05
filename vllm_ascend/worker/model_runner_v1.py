@@ -3782,8 +3782,6 @@ class NPUModelRunner(GPUModelRunner):
             and _tail_head_token is not None
             and _tail_head_token in self._edge_prepare_cache
             and self.input_batch.num_reqs > 0
-            and tuple(self.input_batch.req_ids)
-            == tuple(scheduler_output.num_scheduled_tokens)
         )
         # 2P1D: a tail that misses fast path (e.g. req_ids mismatch when two
         # prefills are in flight) re-prepares on the slow path, so its cached
@@ -3819,6 +3817,22 @@ class NPUModelRunner(GPUModelRunner):
             # so a later segment_a (different head_token) does not hand the
             # wrong attn_metadata to this PL.
             cache = _edge_cache_entry
+            # If intervening decode batches disrupted input_batch (req_ids no
+            # longer match this tail's scheduled reqs), re-add the prefill req
+            # via _update_states so the tail can sample and record the first
+            # token. The cached layout (keyed by head_token) is still correct
+            # and is reused below -- we do NOT recompute it via _prepareInputs.
+            # When req_ids already match, the req is in input_batch, so skip
+            # _update_states to avoid double-counting. deferred_state_corrections_fn
+            # (None when MTP/spec-decode is off) is applied at the end of
+            # execute_model.
+            if (tuple(self.input_batch.req_ids)
+                    != tuple(scheduler_output.num_scheduled_tokens)):
+                deferred_state_corrections_fn = self._update_states(
+                    scheduler_output
+                )
+            else:
+                deferred_state_corrections_fn = None
             total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
             num_tokens_padded = cache["num_tokens_padded"]
             num_tokens_across_dp = cache["num_tokens_across_dp"]
@@ -3858,8 +3872,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                     non_blocking=True,
                 )
-            # Fast path skips _update_states, so no deferred corrections.
-            deferred_state_corrections_fn = None
+
             # [方案③-fix Part 1] tail segment (PL/DL) reuses the head's cached
             # num_tokens_across_dp and skips _determine_batch_execution_and_padding,
             # so it does NOT enter the cross-DP all_reduce. But the idle DP's
@@ -8652,7 +8665,6 @@ class NPUModelRunner(GPUModelRunner):
                     # the min of all `num_blocks`. Verify it here.
 
                     state_tensors = []
-                    target_idx = 0
                     start_idx = 0
                     # NOTE(zxr): in order to keep all tensor contiguous, we align ssm and kv block
                     # with same page size, so have to add extra padding block for kv, the overall
@@ -8660,15 +8672,92 @@ class NPUModelRunner(GPUModelRunner):
                     # tensor1: [(kv_padding), conv           , ...]
                     # tensor2: [k           , ssm            , ...]
                     # tensor3: [v           , (mamba_padding), ...]
+                    #
+                    # [FIX] When THIS tensor is also shared by a full-attention
+                    # layer, the ssm region aliases the K region block-for-block
+                    # by design: the block allocator assigns each block id to
+                    # exactly one purpose (KV or mamba state), which keeps the
+                    # aliasing consistent.  That requires ssm block N to map
+                    # onto K block N, i.e. the ssm region must start where the
+                    # K region starts and the ssm block stride must equal the
+                    # attention K block size.  A contiguous ssm view breaks
+                    # the mapping whenever the per-block ssm size differs
+                    # from the K block size (edge-cloud with cloud TP8: 6
+                    # per-rank ssm heads -> 393216B ssm block vs 786432B K
+                    # block, so ssm block N lands on K block N/2 and mamba
+                    # state writes clobber live KV, producing NaN logits).
+                    #
+                    # Pure-mamba tensors (not shared with attention) keep the
+                    # legacy contiguous carve, so non-sharing configurations
+                    # (e.g. non-edge-cloud) are byte-identical to before.
+                    # Tensor sizes and num_blocks are untouched — only the
+                    # view offsets/strides change, and the padded ssm span is
+                    # asserted to fit inside the K region (no KV block is
+                    # lost or shrunk).
+                    k_block_bytes = 0
+                    if self.hybrid_with_attn_and_mamba:
+                        for _kct in kv_cache_config.kv_cache_tensors:
+                            _names = list(_kct.shared_by)
+                            if layer_name not in _names:
+                                continue
+                            for _name in _names:
+                                _spec = layer_kv_cache_spec.get(_name)
+                                # NOTE: MLA (and its HiddenStateCacheSpec
+                                # subclass) has different block geometry, so
+                                # only plain full-attention specs define the
+                                # K block size the ssm region must alias.
+                                if (isinstance(_spec, AttentionSpec)
+                                        and not isinstance(_spec, MLAAttentionSpec)):
+                                    k_block_bytes = (_spec.block_size
+                                                     * _spec.num_kv_heads
+                                                     * _spec.head_size
+                                                     * get_dtype_size(_spec.dtype))
+                                    break
+                            if k_block_bytes:
+                                break
+                    # Same offset the attention carve computes for the K
+                    # region (raw = conv | ssm≡K | V, with K == V here):
+                    # conv_block_padding_size = numel - 2 * K_span.
+                    ssm_offset = (raw_tensor.numel()
+                                  - 2 * num_blocks * k_block_bytes
+                                  ) if k_block_bytes else None
                     for shape, dtype in zip(current_kv_cache_spec.shapes, current_kv_cache_spec.dtypes):
                         # normally, there is conv state and ssm state in this loop. And there is only
                         # a conv state in some special models.
                         target_shape = (num_blocks, *shape)
-
-                        target_idx += math.prod(target_shape) * get_dtype_size(dtype)
-                        tensor = raw_tensor[start_idx:target_idx].view(dtype).view(target_shape)
-                        start_idx = target_idx
+                        dtype_size = get_dtype_size(dtype)
+                        block_bytes = math.prod(shape) * dtype_size
+                        if ssm_offset is not None and len(shape) == 3:
+                            # ssm state: must alias the K region 1:1 by block.
+                            if block_bytes > k_block_bytes:
+                                raise RuntimeError(
+                                    f"[hybrid kv layout] {layer_name}: ssm "
+                                    f"block ({block_bytes}B) is larger than "
+                                    f"the attention K block ({k_block_bytes}B); "
+                                    f"the shared attn/mamba tensor cannot "
+                                    f"alias ssm onto the K region 1:1. "
+                                    f"Disable hybrid block sharing for this "
+                                    f"configuration.")
+                            span = num_blocks * k_block_bytes
+                            tensor = torch.as_strided(
+                                raw_tensor[ssm_offset:ssm_offset + span].view(dtype),
+                                size=target_shape,
+                                stride=(k_block_bytes // dtype_size,
+                                        *torch.empty(shape).stride()))
+                        else:
+                            tensor = raw_tensor[start_idx:start_idx + num_blocks * block_bytes].view(dtype).view(target_shape)
+                            start_idx += num_blocks * block_bytes
                         state_tensors.append(tensor)
+                    if ssm_offset is not None and any(
+                            len(s) == 3 for s in current_kv_cache_spec.shapes):
+                        # The head states (conv) must not spill into the K
+                        # region the ssm view is anchored to.
+                        assert 0 <= start_idx <= ssm_offset, (
+                            f"[hybrid kv layout] {layer_name}: head states "
+                            f"span {start_idx}B but the K region starts at "
+                            f"{ssm_offset}B (raw {raw_tensor.numel()}B, K "
+                            f"block {k_block_bytes}B); page accounting "
+                            f"mismatch.")
                     kv_caches[layer_name] = state_tensors
                 else:
                     raise ValueError("Unknown KV cache spec type.")
