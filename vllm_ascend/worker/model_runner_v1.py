@@ -819,6 +819,10 @@ class NPUModelRunner(GPUModelRunner):
         # Saved in execute_model() so sample_tokens() can access scheduler_output
         # for edge-cloud mamba state sync (especially on the cloud side).
         self._last_scheduler_output: "SchedulerOutput | None" = None
+        # True while the parent target-model graph capture loop is running,
+        # including its eager warmups. An eager edge-cloud drafter must not
+        # perform cross-node dummy communication from inside target capture.
+        self._edge_cloud_target_capture_in_progress = False
 
         # Latest cloud-side target metadata for draft paths that do not cross
         # an independent scheduling boundary.
@@ -2753,26 +2757,18 @@ class NPUModelRunner(GPUModelRunner):
         model_type = str(getattr(hf_config, "model_type", "")).lower()
         return "qwen" in model_type or model_type == "deepseek_v4"
 
-    def _is_edge_cloud_mtp_edge_without_draft_kv(self) -> bool:
-        """Return whether this edge rank owns no MTP decoder KV cache.
-
-        Use the drafter's discovered attention layers as the source of truth
-        instead of assuming every edge-cloud MTP split is cloud-only. This
-        keeps startup correct if a future split places draft attention on edge.
-        """
-        is_edge_cloud_mtp_edge = bool(
-            self.speculative_config is not None
-            and getattr(self.speculative_config, "method", None) == "mtp"
-            and getattr(self, "_edge_cloud_enabled", False)
-            and getattr(self.edge_cloud_cfg, "role", None) == "edge"
-            and is_edge_device()
-            and self.drafter is not None
-        )
-        if not is_edge_cloud_mtp_edge:
+    def _edge_cloud_drafter_uses_graph(self) -> bool:
+        """Return whether the loaded edge-cloud draft segments use ACL graphs."""
+        drafter = self.drafter
+        if drafter is None or not drafter.use_cuda_graph:
             return False
 
-        attn_layer_names = getattr(self.drafter, "attn_layer_names", None)
-        return attn_layer_names is not None and not attn_layer_names
+        draft_model = getattr(drafter, "model", None)
+        return not getattr(
+            draft_model,
+            "edge_cloud_dynamic_step_segments",
+            False,
+        )
 
     def _should_defer_edge_cloud_draft(
         self, scheduler_output: "SchedulerOutput"
@@ -7101,10 +7097,18 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if (
-                self.drafter
-                and not self._is_edge_cloud_mtp_edge_without_draft_kv()
-            ):
+            is_scheduled_edge_cloud_draft = (
+                self._edge_cloud_enabled
+                and self.speculative_config is not None
+                and self.speculative_config.method in ("mtp", "eagle3")
+            )
+            skip_eager_edge_cloud_drafter = (
+                self._edge_cloud_target_capture_in_progress
+                and is_scheduled_edge_cloud_draft
+                and self.drafter is not None
+                and not self._edge_cloud_drafter_uses_graph()
+            )
+            if self.drafter and not skip_eager_edge_cloud_drafter:
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -7115,6 +7119,12 @@ class NPUModelRunner(GPUModelRunner):
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                )
+            elif skip_eager_edge_cloud_drafter:
+                logger.info_once(
+                    "[EdgeCloud][GraphCapture] Skipping eager %s drafter "
+                    "dummy run during target graph capture.",
+                    self.speculative_config.method,
                 )
             if is_profile and self.dynamic_eplb:
                 target = self.model.language_model if hasattr(self.model, "language_model") else self.model
@@ -7370,23 +7380,20 @@ class NPUModelRunner(GPUModelRunner):
             self.need_accepted_tokens = False
             self.may_reinitialize_input_batch(kv_cache_config)
             self.kv_cache = {}
-            # Initialize cudagraph dispatcher keys + ACL graph params ONLY for the
-            # MTP edge-cloud path. The MTP drafter segments (_edge_cloud_mtp_segments)
-            # rely on graph_params being set here; without it ACL graph capture/replay
-            # hangs. (Mirrors the `method == "mtp"` guard in _check_and_update_cudagraph_mode.)
+            # A scheduled edge-cloud draft participates in the parent capture
+            # loop only when the loaded drafter actually uses ACL graphs. In
+            # that case the edge needs matching dispatcher keys and graph
+            # params so its per-shape draft communication stays aligned with
+            # the cloud.
             #
-            # DO NOT run this for the non-MTP embedding_only edge. Passing empty
-            # attention backends leaves min_cg_support at ALWAYS, which initializes
-            # the dispatcher keys (keys_initialized=True) and makes dispatch() return
-            # FULL instead of NONE. That flips the edge decode tail (segment_e) from
-            # eager into ACL-graph capture/replay and adds a per-step
-            # update_full_graph_params sync, costing ~2% throughput (94 -> 92 token/s)
-            # and hurting the edge/cloud overlap under --async-scheduling. The edge
-            # tail has no attention layers, so eager is both correct and faster here
-            # -- this is exactly the pre-MTP behavior.
+            # An eager drafter is profiled before target capture and is skipped
+            # while target capture is in progress, so it must not initialize
+            # the otherwise-empty edge dispatcher here.
             if (
                 self.speculative_config is not None
-                and self.speculative_config.method == "mtp"
+                and self.speculative_config.method in ("mtp", "eagle3")
+                and self.drafter is not None
+                and self._edge_cloud_drafter_uses_graph()
             ):
                 self._check_and_update_cudagraph_mode(
                     [], kv_cache_config.kv_cache_groups
@@ -7415,14 +7422,10 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
-            is_edge_cloud_eagle3_edge = (
+            skip_edge_drafter_attn_init = (
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role == "edge"
-                and self.speculative_config.method == "eagle3"
-            )
-            skip_edge_drafter_attn_init = (
-                is_edge_cloud_eagle3_edge
-                or self._is_edge_cloud_mtp_edge_without_draft_kv()
+                and self.speculative_config.method in ("mtp", "eagle3")
             )
             if skip_edge_drafter_attn_init:
                 # All draft decoder layers run on the cloud. Their stale
@@ -8414,9 +8417,14 @@ class NPUModelRunner(GPUModelRunner):
         # 因此这里手动清空，强制重新 capture。
         for wrapper in self._get_aclgraph_wrappers():
             wrapper.concrete_aclgraph_entries.clear()
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            result = GPUModelRunner.capture_model(self)
-        return result
+        self._edge_cloud_target_capture_in_progress = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
+                parent_module_name
+            ):
+                return GPUModelRunner.capture_model(self)
+        finally:
+            self._edge_cloud_target_capture_in_progress = False
 
     def _prepare_multimodal_fields(self):
         """
