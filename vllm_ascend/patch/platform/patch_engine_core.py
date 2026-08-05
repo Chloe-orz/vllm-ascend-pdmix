@@ -778,8 +778,15 @@ def _coordinate_bt(
     tensor[2 * dp_size] = 1 if local_unfinished else 0
     _cnt = getattr(self, "_coord_bt_count", 0) + 1
     self._coord_bt_count = _cnt
+    import time as _ec_perf_time
+    _ar_t0 = _ec_perf_time.monotonic()
     torch.distributed.all_reduce(tensor, group=dp_group)
+    _ar_dt_ms = (_ec_perf_time.monotonic() - _ar_t0) * 1000
     bt_ids = [int(tensor[r].item()) for r in range(dp_size)]
+    logger.error(
+        "[EC-PERF][COORD-BT] dp_rank=%s cnt=%s all_reduce=%.3fms bt_ids=%s",
+        dp_rank, _cnt, _ar_dt_ms, bt_ids,
+    )
     waitings = [int(tensor[dp_size + r].item()) for r in range(dp_size)]
     _engines_running = int(tensor[2 * dp_size].item()) > 0
 
@@ -800,12 +807,22 @@ def _coordinate_bt(
             # Rule 2: let the DP with a ready DL run it (real); the
             # DF-ready peer runs a dummy DL so both align on DF next step.
             winner_id = _DL
+            logger.error(
+                "[EC-PERF][DEFER] dp_rank=%s cnt=%s rule=2(DECODE_LAST) "
+                "bt_ids=%s waitings=%s -> peer dummy DL step",
+                dp_rank, _cnt, bt_ids, waitings,
+            )
         elif _DF in bt_ids and _E in bt_ids:
             # Rule 1: defer DF when the EMPTY peer is waiting on its DL
             # (has decode work). If the EMPTY peer is truly idle, fall
             # through to the default DF so the dummy pairs the a2a.
             if any(bt_ids[r] == _E and waitings[r] for r in range(dp_size)):
                 winner_id = _E
+                logger.error(
+                    "[EC-PERF][DEFER] dp_rank=%s cnt=%s rule=1(EMPTY-defer) "
+                    "bt_ids=%s waitings=%s -> DF deferred 1 step (no compute)",
+                    dp_rank, _cnt, bt_ids, waitings,
+                )
 
     _winner = _BT_COORD_ID_INV.get(winner_id, BatchType.EMPTY)
     # Throttle: log every 32 calls and whenever real work is coordinated.
@@ -1199,7 +1216,16 @@ def _patched_step_with_batch_queue(self):
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
     ):
+        import time as _ec_perf_time
+        _fr_t0 = _ec_perf_time.monotonic()
         model_output = future.result()
+        _fr_dt_ms = (_ec_perf_time.monotonic() - _fr_t0) * 1000
+        vllm_logger.error(
+            "[EC-PERF][EC-BLOCK] dp_rank=%s bt=%s tokens=%s future.result=%.3fms",
+            self.vllm_config.parallel_config.data_parallel_rank,
+            bt.value if bt else "N/A",
+            scheduler_output.total_num_scheduled_tokens, _fr_dt_ms,
+        )
         if model_output is None:
             exec_model_fut.result()
             raise RuntimeError("unexpected error")

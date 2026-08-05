@@ -1690,10 +1690,19 @@ class NPUModelRunner(GPUModelRunner):
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
         packed_tensor[2][self.dp_rank] = self._dp_batch_type_id
+        import time as _ec_perf_time
+        _sm_t0 = _ec_perf_time.monotonic()
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+        _sm_dt_ms = (_ec_perf_time.monotonic() - _sm_t0) * 1000
 
         # Extract peer's batch_type_id (for DUMMY to match real's segment)
         self._peer_batch_type_id = int(packed_tensor[2, 1 - self.dp_rank].item())
+        logger.error(
+            "[EC-PERF][SYNC-META] dp_rank=%s my_bt=%s peer_bt=%s "
+            "num_tokens=%s all_reduce=%.3fms",
+            self.dp_rank, self._dp_batch_type_id,
+            self._peer_batch_type_id, num_tokens, _sm_dt_ms,
+        )
 
         # [DPDBG] trace sync_metadata pairing to locate cross-DP misalignment.
         # Compare rank1 (cloud dp0) vs rank6 (cloud dp1) call sequences: the
