@@ -903,7 +903,7 @@ class NPUModelRunner(GPUModelRunner):
             str, CloudDraftPositionState
         ] = {}
         self._eagle3_cloud_aux_hidden_states_by_task: dict[
-            str, torch.Tensor
+            str, torch.Tensor | list[torch.Tensor]
         ] = {}
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
@@ -1033,7 +1033,9 @@ class NPUModelRunner(GPUModelRunner):
         # Cloud-side cache for EAGLE3 aux hidden states produced by the target
         # model's cloud segment. These hidden states are consumed by the draft
         # model's cloud segment without crossing the edge-cloud boundary.
-        self._eagle3_cloud_aux_hidden_states: torch.Tensor | None = None
+        self._eagle3_cloud_aux_hidden_states: (
+            torch.Tensor | list[torch.Tensor] | None
+        ) = None
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1177,7 +1179,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         segment: Any,
         intermediate_tensors: IntermediateTensors,
-        aux_hidden_states: torch.Tensor | None,
+        aux_hidden_states: torch.Tensor | list[torch.Tensor] | None,
         num_tokens: int,
         is_first_step: bool,
     ) -> None:
@@ -1187,6 +1189,9 @@ class NPUModelRunner(GPUModelRunner):
         itself must have one static execution path so that ACL graph replay does
         not reuse the first-step fusion branch for later speculative steps.
         """
+        aux_hidden_states = self._combine_eagle3_cloud_aux_hidden_states(
+            aux_hidden_states
+        )
         if aux_hidden_states is None:
             if is_first_step:
                 raise RuntimeError(
@@ -1220,49 +1225,62 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states.copy_(fused_hidden_states)
 
     @staticmethod
-    def _merge_eagle3_cloud_aux_hidden_states(
-        previous: torch.Tensor | None,
-        current: torch.Tensor | None,
+    def _combine_eagle3_cloud_aux_hidden_states(
+        aux_hidden_states: torch.Tensor | list[torch.Tensor] | None,
     ) -> torch.Tensor | None:
-        """Append auxiliary target states produced by one layer slice.
+        """Combine retained layer-slice outputs when the draft consumes them."""
+        if aux_hidden_states is None or torch.is_tensor(aux_hidden_states):
+            return aux_hidden_states
+        if not isinstance(aux_hidden_states, list):
+            raise RuntimeError(
+                "EAGLE3 cloud aux_hidden_states must be a tensor or tensor "
+                f"list, got {type(aux_hidden_states).__name__}"
+            )
+        if not aux_hidden_states:
+            return None
 
-        A sliced target forward only returns the Eagle3 auxiliary layers that
-        fall inside the current slice.  Keep the feature dimension in global
-        layer order as slices execute from low to high layer indices.
-        """
-        if current is None:
-            return previous
-        if not torch.is_tensor(current):
+        first = aux_hidden_states[0]
+        if not torch.is_tensor(first):
             raise RuntimeError(
-                "EAGLE3 cloud aux_hidden_states must be a tensor, got "
-                f"{type(current).__name__}"
+                "EAGLE3 cloud aux_hidden_states list must contain tensors"
             )
-        if previous is None:
-            # Segment outputs may point at reusable graph/input buffers.
-            return _freeze_scheduled_state(current)
-        if (
-            previous.ndim != current.ndim
-            or previous.shape[:-1] != current.shape[:-1]
-        ):
-            raise RuntimeError(
-                "EAGLE3 cloud layer slices produced incompatible auxiliary "
-                f"hidden-state shapes: {previous.shape} vs {current.shape}"
-            )
-        # torch.cat copies ``current`` out of the reusable segment output, so
-        # no extra clone is needed once at least one frozen part exists.
-        return torch.cat((previous, current), dim=-1)
+        for current in aux_hidden_states[1:]:
+            if not torch.is_tensor(current):
+                raise RuntimeError(
+                    "EAGLE3 cloud aux_hidden_states list must contain tensors"
+                )
+            if (
+                first.ndim != current.ndim
+                or first.shape[:-1] != current.shape[:-1]
+            ):
+                raise RuntimeError(
+                    "EAGLE3 cloud layer slices produced incompatible auxiliary "
+                    f"hidden-state shapes: {first.shape} vs {current.shape}"
+                )
+        if len(aux_hidden_states) == 1:
+            return first
+        return torch.cat(aux_hidden_states, dim=-1)
 
     def _cache_eagle3_cloud_aux_hidden_states(
         self,
         aux_hidden_states: torch.Tensor | None,
         layer_slice_info: Any,
     ) -> None:
-        """Cache complete target auxiliary states for the matching draft.
+        """Retain target auxiliary states for the matching cloud draft.
 
-        The first slice starts a new accumulator.  Continuation slices must
-        use ``_layerwise_scheduler_output``: an interleaved decode may have
-        replaced ``_last_scheduler_output`` since slice 0 ran.
+        Sliced prefill uses the raw cloud segment, whose outputs are fresh
+        eager tensors. Retain each part without launching clone/cat kernels;
+        the draft combines them only when step 0 consumes the target states.
+        Continuation slices use ``_layerwise_scheduler_output`` because an
+        interleaved decode may have replaced ``_last_scheduler_output``.
         """
+        if (
+            self.speculative_config is None
+            or self.speculative_config.method != "eagle3"
+        ):
+            self._eagle3_cloud_aux_hidden_states = None
+            return
+
         is_first_slice = (
             layer_slice_info is None or layer_slice_info.is_first_slice
         )
@@ -1278,32 +1296,59 @@ class NPUModelRunner(GPUModelRunner):
         )
         use_task_cache = bool(
             self._uses_scheduled_edge_cloud_draft()
-            and self.speculative_config.method == "eagle3"
             and task_id is not None
         )
 
+        if layer_slice_info is not None:
+            if aux_hidden_states is not None and not torch.is_tensor(
+                aux_hidden_states
+            ):
+                raise RuntimeError(
+                    "EAGLE3 cloud aux_hidden_states must be a tensor, got "
+                    f"{type(aux_hidden_states).__name__}"
+                )
+
+            if use_task_cache:
+                assert task_id is not None
+                cached = self._eagle3_cloud_aux_hidden_states_by_task.get(
+                    task_id
+                )
+                parts = (
+                    []
+                    if is_first_slice or not isinstance(cached, list)
+                    else cached
+                )
+            else:
+                cached = self._eagle3_cloud_aux_hidden_states
+                parts = (
+                    []
+                    if is_first_slice or not isinstance(cached, list)
+                    else cached
+                )
+
+            if aux_hidden_states is not None:
+                parts.append(aux_hidden_states)
+            self._eagle3_cloud_aux_hidden_states = parts
+            if use_task_cache:
+                self._eagle3_cloud_aux_hidden_states_by_task[task_id] = parts
+            return
+
+        # Non-sliced target execution may use ACL graph replay, whose output
+        # buffers are reused. Keep the existing clone behavior for that path.
+        frozen_aux_hidden_states = (
+            _freeze_scheduled_state(aux_hidden_states)
+            if aux_hidden_states is not None
+            else None
+        )
+        self._eagle3_cloud_aux_hidden_states = frozen_aux_hidden_states
         if use_task_cache:
             assert task_id is not None
-            if is_first_slice:
-                self._eagle3_cloud_aux_hidden_states_by_task.pop(
-                    task_id, None
+            if frozen_aux_hidden_states is None:
+                self._eagle3_cloud_aux_hidden_states_by_task.pop(task_id, None)
+            else:
+                self._eagle3_cloud_aux_hidden_states_by_task[task_id] = (
+                    frozen_aux_hidden_states
                 )
-            previous = self._eagle3_cloud_aux_hidden_states_by_task.get(
-                task_id
-            )
-        else:
-            previous = (
-                None
-                if is_first_slice
-                else self._eagle3_cloud_aux_hidden_states
-            )
-
-        merged = self._merge_eagle3_cloud_aux_hidden_states(
-            previous, aux_hidden_states
-        )
-        self._eagle3_cloud_aux_hidden_states = merged
-        if use_task_cache and merged is not None:
-            self._eagle3_cloud_aux_hidden_states_by_task[task_id] = merged
 
     def _load_model_edge_cloud(self) -> None:
         """边云场景的模型加载流程（复用 vLLM 标准 PP 初始化，直接加载到 NPU）。
@@ -4890,9 +4935,13 @@ class NPUModelRunner(GPUModelRunner):
             self._cloud_draft_position_state_by_task.pop(
                 stale_task_id, None
             )
-            self._eagle3_cloud_aux_hidden_states_by_task.pop(
-                stale_task_id, None
+            stale_aux_hidden_states = (
+                self._eagle3_cloud_aux_hidden_states_by_task.pop(
+                    stale_task_id, None
+                )
             )
+            if self._eagle3_cloud_aux_hidden_states is stale_aux_hidden_states:
+                self._eagle3_cloud_aux_hidden_states = None
             logger.warning(
                 "Cloud draft metadata cache exceeded bound (%d); evicting "
                 "unconsumed task_id=%s",
@@ -5472,9 +5521,16 @@ class NPUModelRunner(GPUModelRunner):
             self._cloud_draft_position_state_by_task.pop(
                 scheduler_output.draft_task_id, None
             )
-            self._eagle3_cloud_aux_hidden_states_by_task.pop(
-                scheduler_output.draft_task_id, None
+            consumed_aux_hidden_states = (
+                self._eagle3_cloud_aux_hidden_states_by_task.pop(
+                    scheduler_output.draft_task_id, None
+                )
             )
+            if (
+                self._eagle3_cloud_aux_hidden_states
+                is consumed_aux_hidden_states
+            ):
+                self._eagle3_cloud_aux_hidden_states = None
         return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
