@@ -7671,7 +7671,18 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = None
             _skip_head = False
             _skip_tail = False
-            if not is_profile and not is_graph_capturing:
+            # [非边云 fix] 段级 skip 仅适用于边云 PD-separation（head/middle/tail 分段）。
+            # 非边云 DP>1（base scheduler，batch_type=PD_MIX）下必须跑完整 forward：
+            # PD_MIX 不在 _bt_map（仅 EMPTY/PF/PL/DF/DL），_dp_batch_type_id 落到 0，与
+            # DUMMY/idle 不可区分；若放行 skip-both，idle 侧 dummy 见 peer_bt==0 跳过整个
+            # forward，不再配对 real 侧的跨 DP EP all-toall 等集合通信 -> 集合通信计数错位死锁
+            # （单请求即挂：dp1 dummy 卡在 sync_metadata all_reduce，dp0 real 卡在 forward）。
+            # 故非边云一律 _skip_head=_skip_tail=False，走完整 _model_forward（与 baseline 一致）。
+            if (
+                not is_profile
+                and not is_graph_capturing
+                and is_edge_cloud_pp_mode()
+            ):
                 _peer_bt = self._peer_batch_type_id
                 if _peer_bt == 0:  # both DUMMY (idle or waiting)
                     # Skip both segments: no real data to all_gather.
