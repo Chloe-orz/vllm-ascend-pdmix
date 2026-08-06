@@ -746,7 +746,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
+            # Index the *expanded natural-stride* ssm_state view (the same one
+            # the recurrent kernel consumes below) with indices scaled by
+            # ssm_idx_ratio.  Direct advanced indexing on the padded-stride
+            # view created in _reshape_kv_cache_tensors (stride0 = attention K
+            # block size) faults on the Ascend gather/put kernels for the
+            # shared attn/mamba layout, hanging the NPU.
+            state_idx = non_spec_state_indices_tensor * ssm_idx_ratio
+            initial_state = ssm_state_kernel[state_idx].transpose(-1, -2).contiguous()
             clear_ssm_states(initial_state, has_initial_state)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
@@ -761,7 +768,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            ssm_state[non_spec_state_indices_tensor] = (
+            ssm_state_kernel[state_idx] = (
                 last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             )
         elif attn_metadata.num_decodes > 0:
