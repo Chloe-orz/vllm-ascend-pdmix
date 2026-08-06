@@ -282,9 +282,16 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         )
     elif soc_version in {AscendDeviceType.A2}:
         num_experts = vllm_config.model_config.get_num_experts()
-        ep_world_size = (
-            vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
-        )
+        world_size_across_dp_v = vllm_config.parallel_config.world_size_across_dp
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        # In edge-cloud mode, only cloud ranks have MoE layers, so the EP
+        # world size should NOT be divided by PP (which includes the edge
+        # stage that has no experts).
+        edge_cloud_cfg = get_ascend_config().edge_cloud_config
+        if edge_cloud_cfg is not None and edge_cloud_cfg.enabled:
+            ep_world_size = world_size_across_dp_v
+        else:
+            ep_world_size = world_size_across_dp_v // pp_size
         num_experts_per_device = num_experts // ep_world_size
         if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
             moe_comm_type = MoECommType.MC2
