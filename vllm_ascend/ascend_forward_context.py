@@ -282,17 +282,28 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         )
     elif soc_version in {AscendDeviceType.A2}:
         num_experts = vllm_config.model_config.get_num_experts()
-        ep_world_size = (
-            vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
-        )
+        world_size_across_dp_v = vllm_config.parallel_config.world_size_across_dp
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        ep_world_size = world_size_across_dp_v // pp_size
         num_experts_per_device = num_experts // ep_world_size
-        if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
+        cond_experts = num_experts_per_device <= 24
+        cond_ep_world = ep_world_size >= 16
+        cond_tokens = num_tokens <= mc2_tokens_capacity
+        if cond_experts and cond_ep_world and cond_tokens:
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLGATHER
         logger.error(
-            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s soc=A2 => %s",
-            num_tokens, moe_comm_type.name,
+            "[EC-PERF][MOE-COMM-SELECT] soc=A2 num_tokens=%s mc2_capacity=%s "
+            "num_experts=%s world_across_dp=%s pp=%s ep_world=%s "
+            "experts_per_device=%s "
+            "cond(experts<=24)=%s cond(ep>=16)=%s cond(tokens<=cap)=%s "
+            "=> %s",
+            num_tokens, mc2_tokens_capacity,
+            num_experts, world_size_across_dp_v, pp_size, ep_world_size,
+            num_experts_per_device,
+            cond_experts, cond_ep_world, cond_tokens,
+            moe_comm_type.name,
         )
 
     elif soc_version in {AscendDeviceType.A3}:
