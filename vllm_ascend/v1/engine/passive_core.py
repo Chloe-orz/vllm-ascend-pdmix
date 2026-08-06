@@ -630,6 +630,13 @@ class PassiveEngineCoreProc:
         if not self.passive_scheduler.sync_queue_state():
             return False
 
+        # 空闲跳过调度：sync_queue_state 已跨 DP 交换队列长度，若所有云 DP 均无工作
+        # (ready/active 全空) 则跳过 schedule() 的 2 次 all_reduce + 调度逻辑。
+        # 两云 DP 持相同视图，同跳同不跳，barrier 配对不变；有任一 DP 有工作时
+        # has_any_work=True 照常调度（idle DP 走 replay dummy 配对）。
+        if not getattr(self.passive_scheduler, "_synced_has_any_work", True):
+            return False
+
         _t0 = time.monotonic()
         batch = self.passive_scheduler.schedule()
         _dt_sched = (time.monotonic() - _t0) * 1000

@@ -925,11 +925,22 @@ class PassiveScheduler:
         _cc_t0 = time.monotonic()
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM,
                          group=self.dp_coord_group)
-        logger.error(
-            "[EC-PERF][CLOUD-COORD] dp_rank=%s phase=sync_queue all_reduce=%.3fms",
-            self.vllm_config.parallel_config.data_parallel_rank,
-            (time.monotonic() - _cc_t0) * 1000,
+        _cc_dt_ms = (time.monotonic() - _cc_t0) * 1000
+        # Any work across all cloud DPs? (5 fields/DP: pf/dec/pdmix/slices/active)
+        # After this all_reduce both DPs hold the same view, so both make the
+        # same skip decision -> barrier pairing preserved.
+        has_any_work = any(
+            int(tensor[i].item()) != 0 for i in range(_dp_size * 5)
         )
+        self._synced_has_any_work = has_any_work
+        # 仅在有工作时打印，避免空闲刷屏（空闲时仍保留 1 次 all_reduce 作为探测）
+        if has_any_work:
+            logger.error(
+                "[EC-PERF][CLOUD-COORD] dp_rank=%s phase=sync_queue "
+                "all_reduce=%.3fms has_work=%s",
+                self.vllm_config.parallel_config.data_parallel_rank,
+                _cc_dt_ms, has_any_work,
+            )
 
         # Verify all rank values are identical for each of the 5 queues.
         all_match = True
