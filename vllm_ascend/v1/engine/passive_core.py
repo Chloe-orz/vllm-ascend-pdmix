@@ -856,7 +856,13 @@ class PassiveEngineCoreProc:
 
         executor = None
         try:
+            logger.info(
+                "[ECStartup][S4][CloudCore] executor_init begin."
+            )
             executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+            logger.info(
+                "[ECStartup][S4][CloudCore] executor_init complete."
+            )
 
             ready_pipe.send({"status": "READY"})
             ready_pipe.close()
@@ -915,14 +921,35 @@ class PassiveEngineCoreProc:
                 _dp_rank = getattr(
                     vllm_config.parallel_config, "data_parallel_rank", 0
                 )
+                _addr_store_port = master_port + 1 + _dp_rank
+                logger.info(
+                    "[ECStartup][S4.1][CloudAddressStore] connect begin "
+                    "host=%s port=%d dp_rank=%d cloud_ip=%s.",
+                    master_addr,
+                    _addr_store_port,
+                    _dp_rank,
+                    _cloud_ip,
+                )
                 _addr_store = dist.TCPStore(
                     host_name=master_addr,
-                    port=master_port + 1 + _dp_rank,
+                    port=_addr_store_port,
                     world_size=2,
                     is_master=False,
                     timeout=timedelta(seconds=600),
                 )
+                logger.info(
+                    "[ECStartup][S4.1][CloudAddressStore] connected "
+                    "port=%d dp_rank=%d.",
+                    _addr_store_port,
+                    _dp_rank,
+                )
                 _addr_store.set("cloud_ip", _cloud_ip)
+                logger.info(
+                    "[ECStartup][S4.1][CloudAddressStore] handshake complete "
+                    "port=%d dp_rank=%d.",
+                    _addr_store_port,
+                    _dp_rank,
+                )
                 del _addr_store
 
                 # ZMQ ports are offset per DP rank on the edge side

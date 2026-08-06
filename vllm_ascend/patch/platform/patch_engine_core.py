@@ -97,7 +97,9 @@ _ORIG_RUN_ENGINE_CORE = EngineCoreProc.run_engine_core
 # =======================================================================#
 @functools.wraps(_ORIG_ENGINE_CORE_INIT)
 def _patched_engine_core_init(self, *args, **kwargs):
+    logger.info("[ECStartup][S4][EdgeCore] base_init begin.")
     _ORIG_ENGINE_CORE_INIT(self, *args, **kwargs)
+    logger.info("[ECStartup][S4][EdgeCore] base_init complete.")
 
     parallel_config: ParallelConfig = self.vllm_config.parallel_config
 
@@ -139,14 +141,35 @@ def _patched_engine_core_init(self, *args, **kwargs):
         # symmetric writer side.
         import torch.distributed as dist
         from datetime import timedelta
+        addr_store_port = parallel_config.master_port + 1 + dp_rank
+        logger.info(
+            "[ECStartup][S4.1][EdgeAddressStore] create begin "
+            "host=%s port=%d dp_rank=%d.",
+            parallel_config.master_addr,
+            addr_store_port,
+            dp_rank,
+        )
         _addr_store = dist.TCPStore(
             host_name=parallel_config.master_addr,
-            port=parallel_config.master_port + 1 + dp_rank,
+            port=addr_store_port,
             world_size=2,
             is_master=True,
             timeout=timedelta(seconds=300),
         )
+        logger.info(
+            "[ECStartup][S4.1][EdgeAddressStore] peer connected "
+            "port=%d dp_rank=%d.",
+            addr_store_port,
+            dp_rank,
+        )
         cloud_addr = _addr_store.get("cloud_ip").decode()
+        logger.info(
+            "[ECStartup][S4.1][EdgeAddressStore] handshake complete "
+            "port=%d dp_rank=%d cloud_addr=%s.",
+            addr_store_port,
+            dp_rank,
+            cloud_addr,
+        )
         del _addr_store
 
         # Each DP rank needs its own ZMQ port pair to avoid bind

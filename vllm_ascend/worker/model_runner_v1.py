@@ -7694,6 +7694,14 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self) -> None:
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S1.1][ProfileRun] begin role=%s "
+                "max_num_tokens=%d draft_method=%s.",
+                self.edge_cloud_cfg.role,
+                self.max_num_tokens,
+                getattr(self.speculative_config, "method", None),
+            )
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
@@ -7718,6 +7726,11 @@ class NPUModelRunner(GPUModelRunner):
         finally:
             self.supports_mm_inputs = original_supports_mm_inputs
             self.max_num_tokens = origin_max_num_tokens
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S1.1][ProfileRun] complete role=%s.",
+                self.edge_cloud_cfg.role,
+            )
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
@@ -7835,6 +7848,14 @@ class NPUModelRunner(GPUModelRunner):
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S2.0][KVConfig] begin role=%s "
+                "num_blocks=%d num_groups=%d.",
+                self.edge_cloud_cfg.role,
+                kv_cache_config.num_blocks,
+                len(kv_cache_config.kv_cache_groups),
+            )
 
         # For embedding_only edge, skip KV cache tensor allocation and
         # attention backend initialization. The edge does not execute any
@@ -7879,12 +7900,36 @@ class NPUModelRunner(GPUModelRunner):
                 "[EdgeCloud] embedding_only edge skipped KV cache tensor "
                 "allocation and attention backend initialization."
             )
+            logger.info(
+                "[ECStartup][S2][KVCache] complete role=%s "
+                "path=embedding_only_edge_skip.",
+                self.edge_cloud_cfg.role,
+            )
             return
 
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S2.0][KVConfig] complete role=%s "
+                "num_groups=%d.",
+                self.edge_cloud_cfg.role,
+                len(kv_cache_config.kv_cache_groups),
+            )
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S2.1][TargetAttentionBackend] begin role=%s.",
+                self.edge_cloud_cfg.role,
+            )
         self.initialize_attn_backend(kv_cache_config)
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S2.1][TargetAttentionBackend] complete role=%s "
+                "num_attn_groups=%d.",
+                self.edge_cloud_cfg.role,
+                len(self.attn_groups),
+            )
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
@@ -7892,7 +7937,19 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S2.2][KVTensors] begin role=%s.",
+                self.edge_cloud_cfg.role,
+            )
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S2.2][KVTensors] complete role=%s "
+                "num_layers=%d.",
+                self.edge_cloud_cfg.role,
+                len(kv_caches),
+            )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
@@ -7911,8 +7968,9 @@ class NPUModelRunner(GPUModelRunner):
                 # no draft attention layers.
                 self.drafter.draft_attn_groups = []
                 logger.info(
-                    "[EdgeCloud] Edge skipped %s drafter attention backend "
-                    "initialization.",
+                    "[ECStartup][S2.3][DrafterAttentionBackend] skipped "
+                    "role=%s method=%s reason=cloud_only_draft_attention.",
+                    self.edge_cloud_cfg.role,
                     self.speculative_config.method,
                 )
             else:
@@ -7921,13 +7979,44 @@ class NPUModelRunner(GPUModelRunner):
                     if isinstance(self.kernel_block_sizes, list)
                     else self.kernel_block_sizes
                 )
+                if self._edge_cloud_enabled:
+                    logger.info(
+                        "[ECStartup][S2.3][DrafterAttentionBackend] begin "
+                        "role=%s method=%s block_size=%s.",
+                        self.edge_cloud_cfg.role,
+                        self.speculative_config.method,
+                        block_size,
+                    )
                 self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+                if self._edge_cloud_enabled:
+                    logger.info(
+                        "[ECStartup][S2.3][DrafterAttentionBackend] complete "
+                        "role=%s method=%s num_groups=%d.",
+                        self.edge_cloud_cfg.role,
+                        self.speculative_config.method,
+                        len(self.drafter.draft_attn_groups),
+                    )
 
         if has_kv_transfer_group():
+            if self._edge_cloud_enabled:
+                logger.info(
+                    "[ECStartup][S2.4][KVTransferRegistration] begin role=%s.",
+                    self.edge_cloud_cfg.role,
+                )
             get_kv_transfer_group().register_kv_caches(kv_caches)
+            if self._edge_cloud_enabled:
+                logger.info(
+                    "[ECStartup][S2.4][KVTransferRegistration] complete role=%s.",
+                    self.edge_cloud_cfg.role,
+                )
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S2][KVCache] complete role=%s.",
+                self.edge_cloud_cfg.role,
+            )
 
     def _bind_routed_experts_capturer(self, capturer) -> None:
         # Upstream binds via ``module.router.set_capture_fn(...)`` on
@@ -9006,6 +9095,11 @@ class NPUModelRunner(GPUModelRunner):
         # 边云模式的 ACL Graph 仍依赖父类 capture 循环触发 _dummy_run。
         # 实际捕获发生在 segment 级 ACLGraphWrapper 内，通信保持在图外。
         if self._edge_cloud_enabled and not self.edge_cloud_cfg.enable_decode_graph:
+            logger.info(
+                "[ECStartup][S3.2][GraphCapture] skipped role=%s "
+                "reason=edge_cloud_decode_graph_disabled.",
+                self.edge_cloud_cfg.role,
+            )
             return 0
 
         gpu_model_runner_cls = next((cls for cls in self.__class__.__mro__ if cls.__name__ == "GPUModelRunner"), None)
@@ -9021,12 +9115,25 @@ class NPUModelRunner(GPUModelRunner):
         # 因此这里手动清空，强制重新 capture。
         for wrapper in self._get_aclgraph_wrappers():
             wrapper.concrete_aclgraph_entries.clear()
+        if self._edge_cloud_enabled:
+            logger.info(
+                "[ECStartup][S3.2.1][GraphCaptureBody] begin role=%s.",
+                self.edge_cloud_cfg.role,
+            )
         self._edge_cloud_target_capture_in_progress = True
         try:
             with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
                 parent_module_name
             ):
-                return GPUModelRunner.capture_model(self)
+                graph_memory_bytes = GPUModelRunner.capture_model(self)
+            if self._edge_cloud_enabled:
+                logger.info(
+                    "[ECStartup][S3.2.1][GraphCaptureBody] complete role=%s "
+                    "graph_memory_bytes=%d.",
+                    self.edge_cloud_cfg.role,
+                    graph_memory_bytes,
+                )
+            return graph_memory_bytes
         finally:
             self._edge_cloud_target_capture_in_progress = False
 
