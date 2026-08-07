@@ -144,7 +144,7 @@ def _patched_engine_core_init(self, *args, **kwargs):
             port=parallel_config.master_port + 1 + dp_rank,
             world_size=2,
             is_master=True,
-            timeout=timedelta(seconds=1200),
+            timeout=timedelta(seconds=2400),
         )
         cloud_addr = _addr_store.get("cloud_ip").decode()
         del _addr_store

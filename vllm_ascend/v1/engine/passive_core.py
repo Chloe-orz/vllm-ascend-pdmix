@@ -920,7 +920,7 @@ class PassiveEngineCoreProc:
                     port=master_port + 1 + _dp_rank,
                     world_size=2,
                     is_master=False,
-                    timeout=timedelta(seconds=1200),
+                    timeout=timedelta(seconds=2400),
                 )
                 _addr_store.set("cloud_ip", _cloud_ip)
                 del _addr_store
