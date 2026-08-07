@@ -143,6 +143,36 @@ class ACLGraphWrapper:
             entry.input_addresses = input_addresses
             aclgraph = torch.npu.NPUGraph()
 
+            # Edge-cloud Eagle3 diagnostic: make all device work issued by
+            # the eager warmup observable before NPUGraph capture starts.
+            # If this synchronize hangs, the rank has an unmatched/pending
+            # HCCL operation before capture; if it completes, any subsequent
+            # hang is inside the capture path itself.
+            if (
+                self.vllm_config.parallel_config.enable_edge_cloud
+                and self.use_eagle
+            ):
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else -1
+                )
+                logger.warning(
+                    "[GraphDiag] rank=%s pre-capture synchronize begin, "
+                    "mode=%s, batch=%s",
+                    rank,
+                    self.runtime_mode.name,
+                    entry.batch_descriptor,
+                )
+                torch.npu.synchronize()
+                logger.warning(
+                    "[GraphDiag] rank=%s pre-capture synchronize done, "
+                    "mode=%s, batch=%s",
+                    rank,
+                    self.runtime_mode.name,
+                    entry.batch_descriptor,
+                )
+
             with ExitStack() as stack:
                 if self.aclgraph_options.gc_disable:
                     # during every model forward for piecewise aclgraph
