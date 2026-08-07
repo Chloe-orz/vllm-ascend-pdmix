@@ -786,6 +786,7 @@ class NPUWorker(WorkerBase):
                 result[key] = tensor
         return result
 
+    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
