@@ -935,7 +935,7 @@ class PassiveEngineCoreProc:
                     port=_addr_store_port,
                     world_size=2,
                     is_master=False,
-                    timeout=timedelta(seconds=600),
+                    timeout=timedelta(seconds=1200),
                 )
                 logger.info(
                     "[ECStartup][S4.1][CloudAddressStore] connected "

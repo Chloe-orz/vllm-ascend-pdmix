@@ -154,7 +154,7 @@ def _patched_engine_core_init(self, *args, **kwargs):
             port=addr_store_port,
             world_size=2,
             is_master=True,
-            timeout=timedelta(seconds=300),
+            timeout=timedelta(seconds=1200),
         )
         logger.info(
             "[ECStartup][S4.1][EdgeAddressStore] peer connected "
