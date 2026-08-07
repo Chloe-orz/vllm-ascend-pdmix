@@ -2204,7 +2204,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     logger.info(
                         "[ECStartup][S1.1.3][DraftPPSend] begin role=edge "
                         "keys=%s.",
-                        list(output.keys()),
+                        [key for key, _ in output.items()],
                     )
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
@@ -2366,7 +2366,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     logger.info(
                         "[ECStartup][S1.1.3][DraftPPSend] begin role=cloud "
                         "keys=%s.",
-                        list(output.keys()),
+                        [key for key, _ in output.items()],
                     )
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
