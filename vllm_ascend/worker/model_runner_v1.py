@@ -7547,6 +7547,14 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            trace_edge_cloud_profile = is_profile and self._edge_cloud_enabled
+            if trace_edge_cloud_profile:
+                logger.info(
+                    "[ECStartup][S1.1.1][TargetForward] begin role=%s "
+                    "num_tokens=%d.",
+                    self.edge_cloud_cfg.role,
+                    num_tokens_padded,
+                )
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -7562,6 +7570,13 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+            if trace_edge_cloud_profile:
+                logger.info(
+                    "[ECStartup][S1.1.1][TargetForward] complete role=%s "
+                    "output_type=%s.",
+                    self.edge_cloud_cfg.role,
+                    type(outputs).__name__,
                 )
             if self.use_aux_hidden_state_outputs:
                 if isinstance(outputs, IntermediateTensors):
@@ -7586,6 +7601,15 @@ class NPUModelRunner(GPUModelRunner):
                 and not self._edge_cloud_drafter_uses_graph()
             )
             if self.drafter and not skip_eager_edge_cloud_drafter:
+                if trace_edge_cloud_profile:
+                    logger.info(
+                        "[ECStartup][S1.1.2][DrafterDummy] begin role=%s "
+                        "method=%s uses_graph=%s draft_attn_groups=%d.",
+                        self.edge_cloud_cfg.role,
+                        self.speculative_config.method,
+                        self._edge_cloud_drafter_uses_graph(),
+                        len(self.drafter.draft_attn_groups),
+                    )
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -7597,6 +7621,13 @@ class NPUModelRunner(GPUModelRunner):
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
                 )
+                if trace_edge_cloud_profile:
+                    logger.info(
+                        "[ECStartup][S1.1.2][DrafterDummy] complete role=%s "
+                        "method=%s.",
+                        self.edge_cloud_cfg.role,
+                        self.speculative_config.method,
+                    )
             elif skip_eager_edge_cloud_drafter:
                 logger.info_once(
                     "[EdgeCloud][GraphCapture] Skipping eager %s drafter "

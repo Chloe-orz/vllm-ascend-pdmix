@@ -2164,6 +2164,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _run_draft_edge_cloud(self, **model_kwargs) -> torch.Tensor:
         segments = self.runner._edge_cloud_draft_segments
         role = self.runner.edge_cloud_cfg.role
+        forward_context = get_forward_context()
+        trace_startup = bool(
+            forward_context is not None
+            and getattr(forward_context, "in_profile_run", False)
+        )
 
         if role == "edge":
             # Edge first segment: embed only for Eagle3 (fusion happens on the
@@ -2195,16 +2200,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     0, dtype=torch.int64, device="cpu"
                 )
             if get_pp_group().world_size == 2:
+                if trace_startup:
+                    logger.info(
+                        "[ECStartup][S1.1.3][DraftPPSend] begin role=edge "
+                        "keys=%s.",
+                        list(output.keys()),
+                    )
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
                      for k, v in output.items()}
                 )
                 for handle in send_work:
                     handle.wait()
+                if trace_startup:
+                    logger.info(
+                        "[ECStartup][S1.1.3][DraftPPSend] complete "
+                        "role=edge handles=%d.",
+                        len(send_work),
+                    )
 
             # Receive cloud segment result (all decoder layers run on cloud)
             tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft()
+                edge_cloud_broadcast_recv_draft(trace_startup=trace_startup)
             )
             for handle in comm_handles:
                 handle.wait()
@@ -2234,7 +2251,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # sample_tokens returns None before calling _run_merged_draft.
             # Kept here as a fallback if the calling context changes.
             tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft()
+                edge_cloud_broadcast_recv_draft(trace_startup=trace_startup)
             )
             for handle in comm_handles:
                 handle.wait()
@@ -2318,6 +2335,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 batch_descriptor = BatchDescriptor(num_tokens)
                 num_actual_tokens = num_tokens
 
+            if trace_startup:
+                logger.info(
+                    "[ECStartup][S1.1.6][DraftCloudForward] begin "
+                    "role=cloud spec_step=%d num_tokens=%d.",
+                    spec_step_idx,
+                    num_tokens,
+                )
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
@@ -2328,15 +2352,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 is_draft_model=True,
             ):
                 output = segments["c"](**model_kwargs)
+            if trace_startup:
+                logger.info(
+                    "[ECStartup][S1.1.6][DraftCloudForward] complete "
+                    "role=cloud spec_step=%d output_type=%s.",
+                    spec_step_idx,
+                    type(output).__name__,
+                )
             assert isinstance(output, IntermediateTensors)
 
             if get_pp_group().world_size == 2:
+                if trace_startup:
+                    logger.info(
+                        "[ECStartup][S1.1.3][DraftPPSend] begin role=cloud "
+                        "keys=%s.",
+                        list(output.keys()),
+                    )
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
                      for k, v in output.items()}
                 )
                 for handle in send_work:
                     handle.wait()
+                if trace_startup:
+                    logger.info(
+                        "[ECStartup][S1.1.3][DraftPPSend] complete "
+                        "role=cloud handles=%d.",
+                        len(send_work),
+                    )
 
             return output["hidden_states"]
 

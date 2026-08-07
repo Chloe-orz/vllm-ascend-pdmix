@@ -1811,7 +1811,9 @@ def edge_cloud_broadcast_recv(
     return recv_tensor_dict, [], [broadcast_postprocess]
 
 
-def edge_cloud_broadcast_recv_draft() -> tuple[
+def edge_cloud_broadcast_recv_draft(
+    trace_startup: bool = False,
+) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
@@ -1833,19 +1835,59 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
     pp_group = get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
+    role = "edge" if is_edge_device() else "cloud"
 
     if is_pp_npu0:
+        if trace_startup:
+            logger.info(
+                "[ECStartup][S1.1.3][DraftPPRecv] begin role=%s "
+                "tp_rank=%d.",
+                role,
+                tp_group.rank_in_group,
+            )
         tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv_draft: PP tensor_dict is None, "
             "sender may have failed."
         )
+        if trace_startup:
+            logger.info(
+                "[ECStartup][S1.1.3][DraftPPRecv] metadata_complete "
+                "role=%s tp_rank=%d keys=%s handles=%d.",
+                role,
+                tp_group.rank_in_group,
+                list(tensor_dict.keys()),
+                len(comm_handles),
+            )
 
         metadata_list, _ = _split_tensor_dict(tensor_dict)
+        if trace_startup:
+            logger.info(
+                "[ECStartup][S1.1.4][DraftTPMetadataBroadcast] begin "
+                "role=%s tp_rank=%d source=true items=%d.",
+                role,
+                tp_group.rank_in_group,
+                len(metadata_list),
+            )
         tp_group.broadcast_object(metadata_list, src=0)
+        if trace_startup:
+            logger.info(
+                "[ECStartup][S1.1.4][DraftTPMetadataBroadcast] complete "
+                "role=%s tp_rank=%d source=true.",
+                role,
+                tp_group.rank_in_group,
+            )
 
         def broadcast_postprocess():
             _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
+            if trace_startup:
+                logger.info(
+                    "[ECStartup][S1.1.5][DraftTPTensorBroadcast] begin "
+                    "role=%s tp_rank=%d source=true tensors=%d.",
+                    role,
+                    tp_group.rank_in_group,
+                    len(tensor_list),
+                )
             handles = []
             for tensor in tensor_list:
                 if tensor.numel() == 0:
@@ -1858,11 +1900,34 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
                 )
             for handle in handles:
                 handle.wait()
+            if trace_startup:
+                logger.info(
+                    "[ECStartup][S1.1.5][DraftTPTensorBroadcast] complete "
+                    "role=%s tp_rank=%d source=true handles=%d.",
+                    role,
+                    tp_group.rank_in_group,
+                    len(handles),
+                )
 
         comm_postprocess.append(broadcast_postprocess)
         return tensor_dict, comm_handles, comm_postprocess
 
+    if trace_startup:
+        logger.info(
+            "[ECStartup][S1.1.4][DraftTPMetadataBroadcast] begin "
+            "role=%s tp_rank=%d source=false.",
+            role,
+            tp_group.rank_in_group,
+        )
     metadata_list = tp_group.broadcast_object(None, src=0)
+    if trace_startup:
+        logger.info(
+            "[ECStartup][S1.1.4][DraftTPMetadataBroadcast] complete "
+            "role=%s tp_rank=%d source=false items=%d.",
+            role,
+            tp_group.rank_in_group,
+            len(metadata_list) if metadata_list is not None else 0,
+        )
     if metadata_list is None:
         metadata_list = []
     recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
@@ -1875,6 +1940,14 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
             recv_tensor_dict[key] = value
 
     def broadcast_postprocess():
+        if trace_startup:
+            logger.info(
+                "[ECStartup][S1.1.5][DraftTPTensorBroadcast] begin "
+                "role=%s tp_rank=%d source=false tensors=%d.",
+                role,
+                tp_group.rank_in_group,
+                len(recv_tensor_dict),
+            )
         handles = []
         for tensor in recv_tensor_dict.values():
             if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
@@ -1887,6 +1960,14 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
             )
         for handle in handles:
             handle.wait()
+        if trace_startup:
+            logger.info(
+                "[ECStartup][S1.1.5][DraftTPTensorBroadcast] complete "
+                "role=%s tp_rank=%d source=false handles=%d.",
+                role,
+                tp_group.rank_in_group,
+                len(handles),
+            )
 
     return recv_tensor_dict, [], [broadcast_postprocess]
 

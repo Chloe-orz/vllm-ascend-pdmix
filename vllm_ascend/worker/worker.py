@@ -505,6 +505,13 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
+            if self.model_runner.edge_cloud_cfg.enabled:
+                logger.info(
+                    "[ECStartup][S1.2][AvailableMemory] return role=%s "
+                    "bytes=%d source=configured.",
+                    self.model_runner.edge_cloud_cfg.role,
+                    kv_cache_memory_bytes,
+                )
             return kv_cache_memory_bytes
 
         # Execute a forward pass with dummy inputs to profile the memory usage
@@ -567,6 +574,13 @@ class NPUWorker(WorkerBase):
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
+        if self.model_runner.edge_cloud_cfg.enabled:
+            logger.info(
+                "[ECStartup][S1.2][AvailableMemory] return role=%s "
+                "bytes=%d source=profile.",
+                self.model_runner.edge_cloud_cfg.role,
+                int(self.available_kv_cache_memory_bytes),
+            )
 
         return int(self.available_kv_cache_memory_bytes)
 
