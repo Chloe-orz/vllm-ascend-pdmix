@@ -193,6 +193,7 @@ def build_scheduled_draft_tensor_meta(
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
+    hc_mult: int = 1,
     device: str = "npu",
 ) -> ScheduledDraftTensorMeta | None:
     """Build a metadata-free scheduled draft wire schema.
@@ -203,10 +204,15 @@ def build_scheduled_draft_tensor_meta(
     if direction not in ("e2c", "c2e"):
         return None
 
+    tensor_shape = (
+        (num_tokens, hidden_size)
+        if hc_mult == 1
+        else (num_tokens, hc_mult, hidden_size)
+    )
     tensor_meta = TensorMetadata(
         device,
         dtype,
-        (num_tokens, hidden_size),
+        tensor_shape,
     )
     if method in ("mtp", "qwen_mtp", "qwen3_5_mtp"):
         return ScheduledDraftTensorMeta(

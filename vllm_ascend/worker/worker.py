@@ -887,13 +887,25 @@ class NPUWorker(WorkerBase):
             if draft_step_idx == 0
             else len(scheduler_output.num_scheduled_tokens)
         )
+        hidden_size = drafter.hidden_size
+        hc_mult = 1
+        draft_model = getattr(drafter, "model", None)
+        if (
+            getattr(draft_model, "edge_cloud_draft_kind", None)
+            == "deepseek_v4_mtp"
+        ):
+            draft_model_config = speculative_config.draft_model_config
+            draft_hf_config = draft_model_config.hf_config
+            hc_mult = int(getattr(draft_hf_config, "hc_mult", 1))
+            hidden_size = draft_model_config.get_hidden_size()
         return build_scheduled_draft_tensor_meta(
             method=speculative_config.method,
             direction=direction,
             draft_step_idx=draft_step_idx,
             num_tokens=num_tokens,
-            hidden_size=drafter.hidden_size,
+            hidden_size=hidden_size,
             dtype=self.model_runner.dtype,
+            hc_mult=hc_mult,
         )
 
     def _execute_model_edge_head(
