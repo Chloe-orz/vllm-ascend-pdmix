@@ -180,6 +180,7 @@ from vllm_ascend.utils import (
     get_c_env,
     get_compressed_pos_and_indices,
     global_stream,
+    is_moe_model,
     kv_cache_spec_uses_sparse_c8,
     lmhead_tp_enable,
     set_weight_prefetch_method,
@@ -7735,9 +7736,27 @@ class NPUModelRunner(GPUModelRunner):
             )
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
-        if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
+        uses_local_mc2_warmup = select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
-        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}
+        needs_aligned_edge_cloud_draft_warmup = (
+            self._edge_cloud_enabled
+            and self._uses_scheduled_edge_cloud_draft()
+            and is_moe_model(self.vllm_config)
+            and self.vllm_config.parallel_config.enable_expert_parallel
+        )
+        if self.max_num_tokens > mc2_tokens_capacity and (
+            uses_local_mc2_warmup
+            or needs_aligned_edge_cloud_draft_warmup
+        ):
+            if needs_aligned_edge_cloud_draft_warmup:
+                logger.info(
+                    "[ECStartup][S1.0][AlignedWarmup] role=%s "
+                    "num_tokens=%d local_mc2=%s.",
+                    self.edge_cloud_cfg.role,
+                    mc2_tokens_capacity,
+                    uses_local_mc2_warmup,
+                )
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
