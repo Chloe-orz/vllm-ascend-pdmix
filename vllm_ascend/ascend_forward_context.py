@@ -284,13 +284,17 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         num_experts = vllm_config.model_config.get_num_experts()
         world_size_across_dp_v = vllm_config.parallel_config.world_size_across_dp
         pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        # In edge-cloud mode, only cloud ranks have MoE layers, so the EP
-        # world size should NOT be divided by PP (which includes the edge
-        # stage that has no experts).
         edge_cloud_cfg = get_ascend_config().edge_cloud_config
         if edge_cloud_cfg is not None and edge_cloud_cfg.enabled:
-            ep_world_size = world_size_across_dp_v
+            # 边云: EP group 按边/云分组(全 MoE 下边侧 head/tail 也有 expert),用
+            # per-rank 真实 EP (ep_world_size_v = get_ep_group().world_size) -> 云侧 16 /
+            # 边侧 2。world_size_across_dp(=18,非16非2)与 //pp_size(=9,两边都不对)
+            # 都不能正确反映边云非对称 PP 下的 per-rank EP。云 16>=16 走 MC2,边 2<16 走 ALLGATHER。
+            ep_world_size = ep_world_size_v
         else:
+            # 非边云: 保持原有逻辑不动(EP group 在 PP stage 内,大小 = world*dp/pp)。
+            # 不改用 get_ep_group().world_size:world_size 含 PCP/CP 因子,PCP>1 等场景下
+            # 两者可能不等,保持原公式以避免对已验证场景产生任何影响。
             ep_world_size = world_size_across_dp_v // pp_size
         num_experts_per_device = num_experts // ep_world_size
         if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
@@ -298,8 +302,10 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         else:
             moe_comm_type = MoECommType.ALLGATHER
         logger.error(
-            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s soc=A2 => %s",
-            num_tokens, moe_comm_type.name,
+            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s soc=A2 ep_world=%s "
+            "experts/dev=%s => %s",
+            num_tokens, ep_world_size, num_experts_per_device,
+            moe_comm_type.name,
         )
 
     elif soc_version in {AscendDeviceType.A3}:
