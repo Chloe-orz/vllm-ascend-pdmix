@@ -230,14 +230,6 @@ class PDSeparatedScheduler(Scheduler):
 
         self._step_counter: int = 0
 
-        # Monotonic edge-production sequence number stamped on every real
-        # head-segment SchedulerOutput (and dummy) the edge produces, so edge
-        # and cloud workers can correlate edge-vs-cloud execution. Mirrors
-        # head_token: assigned once at production, inherited by tails via
-        # dataclasses.replace. Distinct from the cloud-side
-        # _passive_scheduler_arrival_seq (reception order).
-        self._original_seq_counter: int = 0
-
         # In-flight prefill limit (head-segment batches).
         self.prefill_inflight_limit: int = getattr(
             self.scheduler_config, "pd_prefill_inflight_limit",
@@ -994,132 +986,6 @@ class PDSeparatedScheduler(Scheduler):
             self._draft_last_delay_start_ts = None
             return True
         return False
-    # Cross-DP batch_type coordination (MoE DP>1)                         #
-    # ------------------------------------------------------------------ #
-    def _can_schedule_decode_last_readonly(self) -> bool:
-        """Read-only variant of _can_schedule_decode_last: does NOT reset the
-        delay timer. Used by _intended_batch_type() so the intent query has no
-        side effects on the scheduling state."""
-        if self._decode_last_delay_start_ts is None:
-            return True
-        elapsed_ms = (time.monotonic() - self._decode_last_delay_start_ts) * 1000
-        return elapsed_ms >= self._decode_last_delay_schedule_ms
-
-    def _intended_batch_type(self) -> BatchType:
-        """Read-only query mirroring _pick_by_state priority, WITHOUT any
-        side effect (no _pick_*_batch, no timer reset).
-
-        Returns the batch_type this scheduler WOULD pick, or EMPTY. Used by
-        the EngineCore cross-DP coordinator to agree on a common batch_type
-        before force-scheduling. KV-cache-exhausted empty PF is not predicted
-        here; _schedule_target falls back to dummy in that case (still the
-        same batch_type, so cross-DP pairing is preserved).
-        """
-        state = self._prefill_state()
-        if state in (PrefillState.IDLE, PrefillState.LOW):
-            if self._can_schedule_prefill_first():
-                return BatchType.PREFILL_FIRST
-            if self.decodes_last_ready and self._can_schedule_decode_last_readonly():
-                return BatchType.DECODE_LAST
-            if self._can_schedule_decode_first():
-                return BatchType.DECODE_FIRST
-            if state == PrefillState.LOW and self.prefills_last_ready:
-                return BatchType.PREFILL_LAST
-            return BatchType.EMPTY
-        # HIGH
-        if self.decodes_last_ready and self._can_schedule_decode_last_readonly():
-            return BatchType.DECODE_LAST
-        if self._can_schedule_decode_first():
-            return BatchType.DECODE_FIRST
-        if self.prefills_last_ready:
-            return BatchType.PREFILL_LAST
-        return BatchType.EMPTY
-
-    def _assign_original_seq(self, scheduler_output: SchedulerOutput) -> None:
-        """Stamp the next global edge original_seq on a SchedulerOutput.
-
-        Advances ``_original_seq_counter`` and assigns the new value, so every
-        edge segment - head (P首/D首/Draft首), tail (P尾/D尾/Draft尾), and
-        dummy - gets a unique monotonic number that the edge and cloud workers
-        can log before inference to correlate edge-vs-cloud execution. Heads
-        and edge-pre-generated tails (D尾/Draft尾) are stamped at production;
-        the cloud-echoed P尾 is stamped when the edge picks it (discarding the
-        echoed head value). Distinct from the cloud-side
-        ``_passive_scheduler_arrival_seq`` (reception order).
-        """
-        self._original_seq_counter += 1
-        seq = self._original_seq_counter
-        scheduler_output.original_seq = seq
-        logger.info(
-            "[EC-ORIG] edge produced original_seq=%s batch_type=%s tokens=%s "
-            "head_token=%s",
-            seq,
-            scheduler_output.batch_type.value
-            if scheduler_output.batch_type else None,
-            scheduler_output.total_num_scheduled_tokens,
-            getattr(scheduler_output, "head_token", None),
-        )
-
-    def _make_pd_dummy_batch(self, bt: BatchType) -> SchedulerOutput:
-        """Construct a PD-separation dummy SchedulerOutput of batch_type=bt.
-
-        The dummy carries total_num_scheduled_tokens=0 (worker dispatch routes
-        tokens==0 to _dummy_run, matching the peer's real segment via
-        _peer_batch_type_id). head_token/hidden_channel are set so publish +
-        _hidden_channel_for + _wait_pp_send_work do not choke; the dummy does
-        not isend/recv real data.
-        """
-        so = SchedulerOutput.make_empty()
-        so.batch_type = bt
-        so.head_token = uuid4().hex
-        self._assign_original_seq(so)
-        dp_rank = getattr(self.vllm_config.parallel_config,
-                           "data_parallel_rank", 0)
-        if not getattr(self.vllm_config.parallel_config,
-                       "is_shared_model_edge", False):
-            dp_rank = 0
-        if bt in (BatchType.PREFILL_FIRST, BatchType.PREFILL_LAST):
-            prefill_channel_idx = dp_rank * _PREFILL_CHANNELS_PER_DP + 1
-            so.hidden_channel = HiddenChannelType.prefill(prefill_channel_idx)
-        else:
-            so.hidden_channel = HiddenChannelType.decode(dp_rank + 1)
-        setattr(so, "is_pd_dummy", True)
-        return so
-
-    def _schedule_target(self, target_bt: BatchType) -> SchedulerOutput:
-        """Force-schedule a specific batch_type (cross-DP agreed winner).
-
-        - EMPTY: empty batch (both DPs idle / waiting).
-        - Otherwise: produce REAL work of target_bt if available, else a dummy
-          of target_bt. Either way the returned batch_type == target_bt, so
-          the two DPs execute the same batch_type this step -> edge [0,5] and
-          cloud EP all-toall pair on the same layer.
-        """
-        if target_bt == BatchType.EMPTY:
-            return self._make_empty_batch()
-        if target_bt == BatchType.PREFILL_FIRST:
-            if self._can_schedule_prefill_first():
-                so = self._pick_prefill_first_batch()
-                if so.total_num_scheduled_tokens > 0:
-                    return so
-                # KV-exhausted empty PF: preserve finished_req_ids, fall back.
-                self.finished_req_ids.update(so.finished_req_ids)
-            return self._make_pd_dummy_batch(BatchType.PREFILL_FIRST)
-        if target_bt == BatchType.PREFILL_LAST:
-            if self.prefills_last_ready:
-                return self._pick_prefill_last_batch()
-            return self._make_pd_dummy_batch(BatchType.PREFILL_LAST)
-        if target_bt == BatchType.DECODE_FIRST:
-            if self._can_schedule_decode_first():
-                so = self._pick_decode_first_batch()
-                if so.total_num_scheduled_tokens > 0:
-                    return so
-            return self._make_pd_dummy_batch(BatchType.DECODE_FIRST)
-        if target_bt == BatchType.DECODE_LAST:
-            if self.decodes_last_ready and self._can_schedule_decode_last():
-                return self._pick_decode_last_batch()
-            return self._make_pd_dummy_batch(BatchType.DECODE_LAST)
-        return self._make_empty_batch()
 
     def _pick_prefill_first_batch(self) -> SchedulerOutput:
         saved_running = self.running
@@ -1198,7 +1064,6 @@ class PDSeparatedScheduler(Scheduler):
                 else:
                     scheduler_output.batch_type = BatchType.PREFILL_FIRST
                     scheduler_output.head_token = uuid4().hex
-                    self._assign_original_seq(scheduler_output)
                     scheduler_output.hidden_channel = (
                         self.hidden_channel_manager.allocate_prefill(
                             scheduler_output.head_token
@@ -1408,11 +1273,6 @@ class PDSeparatedScheduler(Scheduler):
         assert so.batch_type == BatchType.PREFILL_LAST, (
             f"prefills_last_ready expects PREFILL_LAST, got {so.batch_type}"
         )
-        # Tail segment: assign the next global original_seq (advances the
-        # counter), discarding the head value echoed by the cloud, so every
-        # edge segment gets a unique monotonic number.
-        self._assign_original_seq(so)
-
         # Mark whether this PL is the request's last prefill chunk.  Mid-chunk
         # PL still has to run the drafter so that the MTP layer populates its
         # KV cache for every prompt chunk; its sampled/draft tokens are only
@@ -1537,7 +1397,6 @@ class PDSeparatedScheduler(Scheduler):
         scheduler_output.batch_type = BatchType.DRAFT_FIRST
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
-        self._assign_original_seq(scheduler_output)
         scheduler_output.hidden_channel = HiddenChannelType.DECODE
         # Draft-first self-posting mirrors the decode path below. Every
         # field needed by DRAFT_LAST is already known on the edge; the cloud
@@ -1553,9 +1412,6 @@ class PDSeparatedScheduler(Scheduler):
             num_accepted_tokens=None,
             valid_sampled_token_count=None,
         )
-        # Tail segment: assign the next global original_seq (advances the
-        # counter) so every edge segment gets a unique monotonic number.
-        self._assign_original_seq(draft_last)
         # is_last_prefill_chunk is a downstream dynamic SchedulerOutput
         # attribute, so dataclasses.replace() does not preserve it.
         draft_last.is_last_prefill_chunk = getattr(
@@ -2187,7 +2043,6 @@ class PDSeparatedScheduler(Scheduler):
                 else:
                     scheduler_output.batch_type = BatchType.DECODE_FIRST
                     scheduler_output.head_token = uuid4().hex
-                    self._assign_original_seq(scheduler_output)
                     scheduler_output.hidden_channel = (
                         self.hidden_channel_manager.decode_channel()
                     )
@@ -2208,10 +2063,6 @@ class PDSeparatedScheduler(Scheduler):
                         scheduler_output,
                         batch_type=BatchType.DECODE_LAST,
                     )
-                    # Tail segment: assign the next global original_seq
-                    # (advances the counter) so every edge segment - head,
-                    # tail, dummy - gets a unique monotonic number.
-                    self._assign_original_seq(decode_last)
                     self.decodes_last_ready.append(decode_last)
                     # ===============================================
                 for req in list(self.waiting):
@@ -2432,13 +2283,6 @@ class PDSeparatedScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, Any]:
-        # Cross-DP coordination dummy: no real requests scheduled, no inflight
-        # count changes, no channel ops. Skip all bt-specific bookkeeping
-        # (else PL/DF branches would wrongly decrement inflight counters that
-        # the dummy never incremented). The worker already ran _dummy_run for
-        # the a2a pairing; there is nothing to update here.
-        if getattr(scheduler_output, "is_pd_dummy", False):
-            return {}
         if scheduler_output.batch_type == BatchType.PREFILL_LAST:
             if self.prefill_inflight_count > 0:
                 self.prefill_inflight_count -= 1

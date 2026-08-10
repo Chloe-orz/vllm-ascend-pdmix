@@ -38,7 +38,7 @@ _FLASHCOMM2_OTP: GroupCoordinator | None = None
 _FLASHCOMM2_ODP: GroupCoordinator | None = None
 
 # ------------------------------------------------------------------ #
-# Per-(channel, direction) dedicated streams for edge-cloud P2P.      #
+# Per-channel dedicated streams for edge-cloud P2P (isend/irecv).     #
 # ------------------------------------------------------------------ #
 # Each hidden channel (PREFILL_1, PREFILL_2) gets its own NPU stream
 # so that isend/irecv on different channels don't serialize on the
@@ -48,73 +48,38 @@ _FLASHCOMM2_ODP: GroupCoordinator | None = None
 # boundaries:
 #   cloud  stream: [irecv hidden_P2 (prefill_2)] [isend result_P1 (prefill_1)]
 #   edge   stream: [irecv result_P1 (prefill_1)] [isend hidden_P2 (prefill_2)]
-#
-# Streams are further keyed by direction: send and recv on the *same*
-# channel use separate streams. This breaks the intra-channel ordering
-# where an isend (cloud->edge P尾) stuck waiting on a slow edge irecv
-# would block the channel's irecv (edge->cloud P首) - with the split,
-# irecv P首 on the recv stream proceeds independently of a blocked
-# isend P尾 on the send stream. Sharing one stream per channel re-
-# creates the deadlock because isend and irecv on that channel
-# serialize (mirrors MindIE's per-batch [recv_stream, send_stream]
-# pair, atb_llm/.../edge_cloud_data_comm.py).
-#
 # TP-broadcast (intra-node collective) stays on the default stream --
 # it runs inside execute_model's wait_for_comm() on all TP ranks
 # synchronized; only the cross-node P2P (isend/irecv) uses the
-# per-(channel, direction) stream, and (when wait=True) handle.wait()
-# syncs back to the default stream before the broadcast.
-_hidden_channel_streams: dict[tuple[Any, str], Any] = {}
+# per-channel stream, and handle.wait() syncs back to the default
+# stream before the broadcast.
+_hidden_channel_streams: dict[Any, Any] = {}
 _hidden_channel_stream_lock = threading.Lock()
 
-# Direction tags for _get_hidden_channel_stream. Send = isend path
-# (cloud->edge P尾 / edge->cloud P首); Recv = irecv path (the reverse).
-_HC_STREAM_SEND = "send"
-_HC_STREAM_RECV = "recv"
 
-
-def _get_hidden_channel_stream(channel: Any, direction: str) -> Any:
-    """Return the dedicated NPU stream for (channel, direction), creating
-    it lazily. Thread-safe (double-checked locking).
-
-    Streams are keyed by (channel, direction): send and recv on the same
-    channel get independent streams so they never serialize on a shared
-    stream.
-    """
-    if direction not in (_HC_STREAM_SEND, _HC_STREAM_RECV):
-        raise ValueError(
-            f"_get_hidden_channel_stream: direction must be "
-            f"{_HC_STREAM_SEND!r} or {_HC_STREAM_RECV!r}, got "
-            f"{direction!r}."
-        )
-    key = (channel, direction)
-    stream = _hidden_channel_streams.get(key)
+def _get_hidden_channel_stream(channel: Any) -> Any:
+    """Return the dedicated NPU stream for *channel*, creating it lazily.
+    Thread-safe (double-checked locking)."""
+    stream = _hidden_channel_streams.get(channel)
     if stream is not None:
         return stream
     with _hidden_channel_stream_lock:
-        stream = _hidden_channel_streams.get(key)
+        stream = _hidden_channel_streams.get(channel)
         if stream is None:
             stream = torch.npu.Stream()
-            _hidden_channel_streams[key] = stream
+            _hidden_channel_streams[channel] = stream
             logger.info(
-                "[edge-cloud] created dedicated %s stream for hidden "
-                "channel %s", direction, channel,
+                "[edge-cloud] created dedicated stream for hidden "
+                "channel %s", channel,
             )
         return stream
 
 
 @contextlib.contextmanager
 def _hidden_channel_stream_ctx(
-    channel: Any | None,
-    direction: str,
-    *,
-    wait_for_default: bool = True,
+    channel: Any | None, *, wait_for_default: bool = True,
 ):
-    """Switch to the (channel, direction) dedicated stream for P2P isend/irecv.
-
-    *direction* -- _HC_STREAM_SEND (isend path) or _HC_STREAM_RECV (irecv
-    path). Each (channel, direction) pair gets its own NPU stream so send
-    and recv on the same channel never serialize on a shared stream.
+    """Switch to the channel's dedicated stream for P2P isend/irecv.
 
     *wait_for_default* – True for the **send** path (the tensor being
     sent was produced on the default/compute stream, so the channel
@@ -128,7 +93,7 @@ def _hidden_channel_stream_ctx(
     if channel is None:
         yield
         return
-    stream = _get_hidden_channel_stream(channel, direction)
+    stream = _get_hidden_channel_stream(channel)
     if wait_for_default:
         stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
@@ -1245,7 +1210,7 @@ def edge_cloud_isend_tensor_dict(
             "was initialized with inconsistent per-tensor shapes; re-init "
             "it or unset VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD."
         )
-        with _hidden_channel_stream_ctx(channel, _HC_STREAM_SEND, wait_for_default=True):
+        with _hidden_channel_stream_ctx(channel, wait_for_default=True):
             handle = torch.distributed.isend(
                 merged, dst=pp_group.ranks[dst], group=group
             )
@@ -1274,7 +1239,7 @@ def edge_cloud_isend_tensor_dict(
             # only happens when upstream code returned a non-standard
             # layout, in which case we materialize once.
             value = value.contiguous()
-        with _hidden_channel_stream_ctx(channel, _HC_STREAM_SEND, wait_for_default=True):
+        with _hidden_channel_stream_ctx(channel, wait_for_default=True):
             handle = torch.distributed.isend(
                 value, dst=pp_group.ranks[dst], group=group
             )
@@ -1404,7 +1369,7 @@ def edge_cloud_irecv_tensor_dict(
         # comm_postprocess list so it runs *after* the irecv handle is
         # waited on by AsyncIntermediateTensors.wait_for_comm().
         with _hidden_channel_stream_ctx(
-            channel, _HC_STREAM_RECV, wait_for_default=False
+            channel, wait_for_default=False
         ):
             # Allocation and first use must share the channel stream. If
             # torch.empty runs on the default stream, a recycled block can
@@ -1461,7 +1426,7 @@ def edge_cloud_irecv_tensor_dict(
             full_size = (recv_num_tokens,) + value.size[1:]
             if key in send_keys:
                 with _hidden_channel_stream_ctx(
-                    channel, _HC_STREAM_RECV, wait_for_default=False
+                    channel, wait_for_default=False
                 ):
                     # Allocate on the stream that performs the first write,
                     # preserving overlap with default-stream compute.
@@ -1602,7 +1567,7 @@ def edge_cloud_send_tensor_dict_scheduled_draft(
             )
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-            with _hidden_channel_stream_ctx(channel, _HC_STREAM_SEND, wait_for_default=True):
+            with _hidden_channel_stream_ctx(channel, wait_for_default=True):
                 handle = torch.distributed.isend(
                     tensor,
                     dst=pp_group.ranks[dst],
@@ -1962,7 +1927,7 @@ def edge_cloud_broadcast_recv_scheduled_draft(
 
             if is_pp_npu0 and key in send_keys:
                 with _hidden_channel_stream_ctx(
-                    channel, _HC_STREAM_RECV, wait_for_default=False
+                    channel, wait_for_default=False
                 ):
                     # Scheduled-draft buffers follow the same allocation-
                     # stream rule as the generic receive path.

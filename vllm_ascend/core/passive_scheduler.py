@@ -15,13 +15,12 @@ The class is intentionally minimal: it shares no implementation with
 import enum
 import math
 import os
-
 import queue
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple
 
 from vllm import envs
 from vllm.logger import logger
@@ -122,17 +121,10 @@ class PassiveScheduler:
         pp_subscriber: "PPSchedulerZmqSubscriber",
         dispatch_policy: DispatchPolicy = DispatchPolicy.EXPECT_ALTERNATION,
         run_subscriber_thread: bool = True,
-        dp_coord_group=None,  # stateless ProcessGroup for cross-DP coordination
     ) -> None:
         self.pp_subscriber = pp_subscriber
-        self.vllm_config = vllm_config
         self.dispatch_policy = dispatch_policy
         self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_PREFILL
-
-        # Optional cross-DP coordination group. Set by the engine core
-        # when dp>1 + MoE + PD-separation.  schedule() uses it to
-        # coordinate batch_type decisions across cloud DPs.
-        self.dp_coord_group = dp_coord_group
 
         self.ready_prefills: deque[SchedulerOutput] = deque()
         self.ready_pdmixes: deque[SchedulerOutput] = deque()
@@ -146,13 +138,6 @@ class PassiveScheduler:
         # these continuation slices; another prefill-like slice-0 may not.
         self._active_sliced_prefill: SchedulerOutput | None = None
         self._active_prefill_slices: deque[SliceTask] = deque()
-
-        # Coordinated mode: pre-synced total slice count for the
-        # ready_prefills head, aligned across DPs via all_reduce(MAX)
-        # before DP0 executes (see _schedule_expect_alternation).  Lets a
-        # dummy on one DP slice the same count as the peer's real prefill
-        # so d_slices stays in sync.  None outside coordinated mode.
-        self._coordinated_total_slices: int | None = None
 
         # Cloud-side P/D interleave guard. After dispatching one prefill-middle
         # slice, EXPECT_EXECUTE_DECODE_OR_DRAFT waits up to 10ms for a decode-middle
@@ -171,10 +156,6 @@ class PassiveScheduler:
 
         # [DIAG] Track DECODE_FIRST arrival intervals on the cloud side.
         self._last_decode_first_arrival_ts: float | None = None
-
-        # [DIAG] Engine-tick counter; incremented once per schedule() call so
-        # slice / DP decisions can be correlated across logs by step number.
-        self._step: int = 0
 
         # Precompute local layer count.  The actual slice count is resolved
         # per-batch from a YAML config (token threshold -> slice count).
@@ -293,40 +274,10 @@ class PassiveScheduler:
                 break
             self._remember_arrival_seq(scheduler_output, seq)
             bt = scheduler_output.batch_type
-            # [DPDBG] classify dummy vs real prefill/decode. The dummy zmq
-            # (from _patched_execute_dummy_batch / _publish_pd_dummy_zmq) is
-            # published with batch_type=DECODE_FIRST but
-            # total_num_scheduled_tokens==0 (the is_pd_dummy attr is lost in
-            # zmq serialization, so the cloud detects dummy by tokens==0).
-            # Distinguish so the dummy-flood vs real-request arrival counts per
-            # cloud DP are visible: the dp=2 PP-init-timeout symptom is one
-            # cloud DP seeing far more dummies before its real PREFILL_FIRST
-            # than the other (e.g. seq=282 vs 68 for the real PREFILL_FIRST).
-            _total = scheduler_output.total_num_scheduled_tokens
-            if _total == 0:
-                _kind = "DUMMY"
-            elif bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
-                _kind = "REAL_PREFILL"
-            elif bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
-                _kind = "REAL_DECODE"
-            elif bt in (BatchType.PREFILL_LAST, BatchType.DECODE_LAST):
-                _kind = "TAIL(edge-only)"
-            else:
-                _kind = f"OTHER({bt.value if bt is not None else None})"
-            _kc = getattr(self, "_dpdbg_kind_count", None)
-            if _kc is None:
-                _kc = {}
-                self._dpdbg_kind_count = _kc
-            _kc[_kind] = _kc.get(_kind, 0) + 1
-            _dp_rank = getattr(
-                getattr(self.vllm_config, "parallel_config", None),
-                "data_parallel_rank", "?",
-            )
             logger.info(
-                "[DPDBG] PassiveScheduler recv: dp_rank=%s seq=%s kind=%s "
-                "batch_type=%s tokens=%s kind_counts=%s",
-                _dp_rank, seq, _kind,
-                bt.value if bt is not None else None, _total, _kc,
+                "Received scheduler_output from edge, seq=%d, batch_type: %s",
+                seq,
+                bt,
             )
             if bt == BatchType.EMPTY:
                 continue
@@ -341,7 +292,7 @@ class PassiveScheduler:
                 now = time.monotonic()
                 if self._last_decode_first_arrival_ts is not None:
                     interval_ms = (now - self._last_decode_first_arrival_ts) * 1000
-                    logger.debug(
+                    logger.info(
                         "DECODE_FIRST arrival interval: %.2f ms",
                         interval_ms,
                     )
@@ -523,29 +474,14 @@ class PassiveScheduler:
         )
 
     def _do_slice(
-        self, so: SchedulerOutput, total_slices: Optional[int] = None,
+        self, so: SchedulerOutput
     ) -> list["LayerSliceInfo | None"]:
         """Compute layer slices for a prefill-like batch."""
-        if total_slices is None:
-            total_slices = self._resolve_slice_count(
-                so.total_num_scheduled_tokens
-            )
-        # [DIAG] Log the resolved slice count with DP + step context so the
-        # per-tick slicing decision can be correlated across cloud DPs.
-        _dp_rank = getattr(
-            self.vllm_config.parallel_config, "data_parallel_rank", "?"
+        total_slices = self._resolve_slice_count(
+            so.total_num_scheduled_tokens
         )
-        _dp_size = getattr(
-            self.vllm_config.parallel_config, "data_parallel_size", 1
-        )
-        logger.info(
-            "[SLICE-DIAG] step=%s dp_rank=%s/%s total_slices=%s",
-            self._step, _dp_rank, _dp_size, total_slices,
-        )
-        # Slicing disabled or trivially 1 slice.
         if total_slices <= 1:
             return [None]
-
         boundaries = self._compute_slice_boundaries(
             self._num_local_layers, total_slices
         )
@@ -555,7 +491,7 @@ class PassiveScheduler:
         ]
 
     def _slice_for(
-        self, so: SchedulerOutput, total_slices: Optional[int] = None,
+        self, so: SchedulerOutput
     ) -> list["LayerSliceInfo | None"]:
         # Decode-like and empty batches are never sliced. DECODE_FIRST is the
         # edge-cloud head segment of a decode step — same per-token shape as
@@ -565,69 +501,19 @@ class PassiveScheduler:
             BatchType.DECODE_FIRST,
             BatchType.DRAFT_FIRST,
         ):
-            if getattr(self, "_step", None):
-                logger.debug(
-                    "[COORD-DIAG] _slice_for step=%d bt=%s → no-slice (decode/draft type)",
-                    self._step, so.batch_type.value if so.batch_type else "?",
-                )
             return [None]
-
-        # Coordinated mode pre-synced a slice count across DPs (see
-        # _schedule_expect_alternation).  When slicing is warranted below
-        # (ready_decodes / cloud_suggest), use this synced count instead of
-        # the local so.tokens, so a dummy on DP0 slices the same N as DP1's
-        # real prefill (else dummy resolve(0)=1 → d_slices=0 → DP1 real
-        # unsliced).  No decode / no suggest still falls through to no-slice
-        # (cold-start: nothing to interleave).  None outside coordinated mode.
-        if total_slices is None:
-            total_slices = getattr(self, "_coordinated_total_slices", None)
 
         # [方案B] Cloud 侧决策：
         # 1. 已有 decode 到达 Cloud → 强制切层（确定性收益）
         if self.ready_decodes:
-            if getattr(self, "_step", None):
-                logger.info(
-                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice (ready_decodes=%d)",
-                    self._step, so.batch_type.value if so.batch_type else "?",
-                    len(self.ready_decodes),
-                )
-            return self._do_slice(so, total_slices)
+            return self._do_slice(so)
 
         # 2. Edge 建议切层（decode 正在路上）→ 切层
-        #    decision.cloud_suggest_slicing 优先，为 None 时回退到 so.cloud_suggest_slicing
-        _cloud_suggest = (
-             getattr(so, "cloud_suggest_slicing", False)
-        )
-        if _cloud_suggest:
-            if getattr(self, "_step", None):
-                logger.info(
-                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice (cloud_suggest=%s)",
-                    self._step, so.batch_type.value if so.batch_type else "?",
-                    _cloud_suggest,
-                )
-            return self._do_slice(so, total_slices)
+        if getattr(so, "cloud_suggest_slicing", False):
+            return self._do_slice(so)
 
-        # 3. 协调模式下 pre-sync 了 >1 的切层意图（peer DP 有 decode 需求）
-        #    → 即使本地无 decode / cloud_suggest 也切层，否则 peer 的 real
-        #    prefill 会被本 DP 的 dummy（d_slices=0）强制不切。冷启动时意图=0，
-        #    此分支不命中，仍走下面的 no-slice。
-        if total_slices is not None and total_slices > 1:
-            if getattr(self, "_step", None):
-                logger.info(
-                    "[COORD-DIAG] _slice_for step=%d bt=%s → do_slice "
-                    "(coordinated_total_slices=%d)",
-                    self._step, so.batch_type.value if so.batch_type else "?",
-                    total_slices,
-                )
-            return self._do_slice(so, total_slices)
-
-        # 4. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
+        # 3. Edge 建议不切层 + Cloud 无 decode → 明确不切层（冷启动优化）
         # 短 prefill（<8k）执行太快，decode 来不及穿插，同样不切层
-        if getattr(self, "_step", None):
-            logger.info(
-                "[COORD-DIAG] _slice_for step=%d bt=%s → no-slice (no decode, no suggest)",
-                self._step, so.batch_type.value if so.batch_type else "?",
-            )
         return [None]
 
     # ------------------------------------------------------------------ #
@@ -704,10 +590,6 @@ class PassiveScheduler:
         slices.  Draft priority is enforced inside the state machine, not via
         an early out-of-band check.
         """
-        # [DIAG] One step per engine tick so slice/DP decisions can be
-        # correlated across logs.  Incremented here (the single per-tick
-        # entry point) regardless of which dispatch path is taken.
-        self._step += 1
         if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
             return self._schedule_expect_alternation()
 
@@ -820,25 +702,6 @@ class PassiveScheduler:
         slices = self._slice_for(self.ready_prefills[0])
         return len(slices) > 1 and isinstance(slices[0], LayerSliceInfo)
 
-    def _ready_prefill_head_is_dummy(self) -> bool:
-        """True when the ready_prefills head is an edge placeholder dummy.
-
-        A PREFILL_FIRST dummy carries total_num_scheduled_tokens==0 (the
-        is_pd_dummy marker is lost in zmq serialization, so the cloud
-        detects it by tokens==0).  It is never sliced, so on a single DP it
-        needs no arrival-order arbitration.  But under coordinated + replay
-        scheduling, DP0's prefill decision propagates to peer DPs via
-        _replay_by_deltas, and the edge-cloud hidden channel requires both
-        sides to run the same batch_type per tick.  Letting a dummy skip
-        _schedule_by_arrival can therefore force the cloud to run prefill
-        while the edge runs decode (the decode arrived first) -- a
-        cross-side hidden-channel mismatch deadlock.  Route dummies through
-        _schedule_by_arrival so the arrival order still wins.
-        """
-        if not self.ready_prefills:
-            return False
-        return self.ready_prefills[0].total_num_scheduled_tokens == 0
-
     def _schedule_by_arrival(self) -> ScheduledBatch:
         prefill_seq = self._arrival_seq(self.ready_prefills[0])
         decode_seq = self._arrival_seq(self.ready_decodes[0])
@@ -880,192 +743,8 @@ class PassiveScheduler:
         self._start_prefill_middle_throttle()
         return self._build_batch(self.ready_prefills.popleft())
 
-    # ------------------------------------------------------------------ #
-    # EXPECT_ALTERNATION: decision / coordination / application           #
-    # ------------------------------------------------------------------ #
-
-    def sync_queue_state(self) -> bool:
-        """Sync queue lengths across cloud DPs via all_reduce.
-
-        Checks that ready_prefills, ready_decodes, ready_pdmixes,
-        _active_prefill_slices, and _active_sliced_prefill have consistent
-        lengths/non-None status across all DPs.  If any queue is out of
-        sync, the method returns False so the caller can sleep and retry.
-
-        When dp_coord_group is not set or coordination is disabled,
-        returns True immediately (no sync needed).
-        """
-        if self.dp_coord_group is None or not self._is_coordinated_dp():
-            return True
-
-        import torch
-        import torch.distributed as dist
-        _dp_size = getattr(
-            self.vllm_config.parallel_config, "data_parallel_size", 1
-        )
-        _dp_rank = getattr(
-            self.vllm_config.parallel_config, "data_parallel_rank", 0
-        )
-
-        # 5 fields: ready_prefills, ready_decodes, ready_pdmixes,
-        #           _active_prefill_slices, has _active_sliced_prefill
-        local = [
-            len(self.ready_prefills),
-            len(self.ready_decodes),
-            len(self.ready_pdmixes),
-            len(self._active_prefill_slices),
-            1 if self._active_sliced_prefill is not None else 0,
-        ]
-
-        # Each rank writes to its own row; SUM leaves values independent.
-        tensor = torch.zeros(_dp_size * 5, dtype=torch.int32, device="cpu")
-        base = _dp_rank * 5
-        for i, v in enumerate(local):
-            tensor[base + i] = v
-        _cc_t0 = time.monotonic()
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM,
-                         group=self.dp_coord_group)
-        _cc_dt_ms = (time.monotonic() - _cc_t0) * 1000
-        # Any work across all cloud DPs? (5 fields/DP: pf/dec/pdmix/slices/active)
-        # After this all_reduce both DPs hold the same view, so both make the
-        # same skip decision -> barrier pairing preserved.
-        has_any_work = any(
-            int(tensor[i].item()) != 0 for i in range(_dp_size * 5)
-        )
-        self._synced_has_any_work = has_any_work
-        # 仅在有工作时打印，避免空闲刷屏（空闲时仍保留 1 次 all_reduce 作为探测）
-        if has_any_work:
-            logger.error(
-                "[EC-PERF][CLOUD-COORD] dp_rank=%s phase=sync_queue "
-                "all_reduce=%.3fms has_work=%s",
-                self.vllm_config.parallel_config.data_parallel_rank,
-                _cc_dt_ms, has_any_work,
-            )
-
-        # Verify all rank values are identical for each of the 5 queues.
-        all_match = True
-        for q in range(5):
-            vals = [int(tensor[r * 5 + q].item()) for r in range(_dp_size)]
-            if len(set(vals)) != 1:
-                _names = ["ready_prefills", "ready_decodes", "ready_pdmixes",
-                          "_active_prefill_slices", "_active_sliced_prefill"]
-                logger.warning(
-                    "[SYNC-QUEUE] rank=%s %s mismatch: %s",
-                    _dp_rank, _names[q], vals,
-                )
-                all_match = False
-        return all_match
-
     def _schedule_expect_alternation(self) -> ScheduledBatch:
-        """EE 交替调度入口。
-
-        非协调模式：直通 _schedule_expect_alternation_simple。
-        协调模式（all_reduce）：
-          - DP0 执行 simple，记录前后队列快照。
-          - DP0 写入差值 tensor，DP1+ 写零，all_reduce(SUM) 传播。
-          - DP1+ 根据差值 _replay_by_deltas 复刻执行。
-        """
-        if self.dp_coord_group is None or not self._is_coordinated_dp():
-            self._coordinated_total_slices = None
-            return self._schedule_expect_alternation_simple()
-
-        import torch
-        import torch.distributed as dist
-
-        _dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-
-        # Pre-sync the prefill slice *intent* across DPs *before* DP0
-        # executes.  Intent = resolve(head tokens) only when this DP has a
-        # decode demand (ready_decodes non-empty OR head cloud_suggest), else
-        # 0.  all_reduce(MAX) makes both DPs slice when *either* DP has decode
-        # demand, so a dummy on DP0 follows DP1's real prefill (which carries
-        # the cloud_suggest / decode signal); cold-start (no decode demand on
-        # either DP) -> intent 0 -> no slice.  _slice_for honors this on DP0;
-        # DP1 follows via d_slices in _replay_by_deltas.
-        _has_decode_demand = bool(self.ready_decodes) or (
-            bool(self.ready_prefills)
-            and getattr(self.ready_prefills[0], "cloud_suggest_slicing", False)
-        )
-        _local_intent = (
-            self._resolve_slice_count(
-                self.ready_prefills[0].total_num_scheduled_tokens
-            )
-            if (self.ready_prefills and _has_decode_demand) else 0
-        )
-        _sync = torch.tensor([_local_intent], dtype=torch.int32)
-        _cc_t0 = time.monotonic()
-        dist.all_reduce(_sync, op=dist.ReduceOp.MAX,
-                        group=self.dp_coord_group)
-        logger.error(
-            "[EC-PERF][CLOUD-COORD] dp_rank=%s phase=intent_max all_reduce=%.3fms",
-            _dp_rank, (time.monotonic() - _cc_t0) * 1000,
-        )
-        self._coordinated_total_slices = int(_sync.item()) or None
-
-        if _dp_rank == 0:
-            # --- DP0: 执行 + 记录 ---
-            before = self._queue_snapshot()
-            batch = self._schedule_expect_alternation_simple()
-            after = self._queue_snapshot()
-
-            d_prefills = after[0] - before[0]
-            d_decodes  = after[1] - before[1]
-            d_pdmixes  = after[2] - before[2]
-            d_slices   = after[3] - before[3]
-
-            logger.debug(
-                "[COORD-SNAPSHOT] DP0 before=%s after=%s "
-                "deltas=(pf=%d, dec=%d, dmix=%d, slices=%d)",
-                before, after,
-                d_prefills, d_decodes, d_pdmixes, d_slices,
-            )
-        else:
-            d_prefills = d_decodes = d_pdmixes = d_slices = 0
-            batch = None
-
-        # all_reduce: DP0 写入，DP1+ 写零 → SUM 后所有人拿到 DP0 的值
-        _tensor = torch.tensor(
-            [d_prefills, d_decodes, d_pdmixes, d_slices],
-            dtype=torch.int32,
-        )
-        _cc_t0 = time.monotonic()
-        dist.all_reduce(_tensor, op=dist.ReduceOp.SUM,
-                         group=self.dp_coord_group)
-        logger.error(
-            "[EC-PERF][CLOUD-COORD] dp_rank=%s phase=deltas_sum all_reduce=%.3fms",
-            _dp_rank, (time.monotonic() - _cc_t0) * 1000,
-        )
-        d_prefills, d_decodes, d_pdmixes, d_slices = _tensor.tolist()
-
-        if _dp_rank == 0:
-            return batch
-        else:
-            logger.debug(
-                "[COORD-REPLAY] DP%d deltas=(pf=%d, dec=%d, dmix=%d, slices=%d)",
-                _dp_rank, d_prefills, d_decodes, d_pdmixes, d_slices,
-            )
-            return self._replay_by_deltas(
-                d_prefills, d_decodes, d_pdmixes, d_slices,
-            )
-
-    def _is_coordinated_dp(self) -> bool:
-        """True when cross-DP coordination should be active on the cloud side:
-        dp_coord_group is set AND model is MoE AND PD-separation is enabled."""
-        return (
-            bool(getattr(self.vllm_config.model_config, "is_moe", False))
-            and getattr(
-                self.vllm_config.parallel_config, "enable_edge_cloud", False
-            )
-        )
-
-    def _schedule_expect_alternation_simple(self) -> ScheduledBatch:
-        """Original single-DP EEP/EED state machine (no cross-DP coord)."""
         state = self.cloud_scheduling_state
-        logger.debug(
-            "[COORD-DIAG] DP%s simple-enter state=%s",
-            getattr(self.vllm_config.parallel_config, "data_parallel_rank", 0),
-            state.name,
-        )
         if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
             if self._active_prefill_slices:
                 self.cloud_scheduling_state = (
@@ -1076,10 +755,7 @@ class PassiveScheduler:
             if self.ready_prefills:
                 if (
                     self.ready_decodes
-                    and (
-                        self._ready_prefill_is_sliced_first_block()
-                        or self._ready_prefill_head_is_dummy()
-                    )
+                    and self._ready_prefill_is_sliced_first_block()
                 ):
                     return self._schedule_by_arrival()
                 self.cloud_scheduling_state = (
@@ -1132,85 +808,6 @@ class PassiveScheduler:
             return self._pick_prefill_batch()
         return ScheduledBatch.empty()
 
-    def _queue_snapshot(self) -> tuple[int, int, int, int]:
-        """返回 (prefills_len, decodes_len, pdmixes_len, slices_len)。"""
-        return (
-            len(self.ready_prefills),
-            len(self.ready_decodes),
-            len(self.ready_pdmixes),
-            len(self._active_prefill_slices),
-        )
-
-    def _replay_prefill_with_slices(
-        self, d_slices: int,
-    ) -> ScheduledBatch:
-        """复刻 DP0 的 prefill 操作，绕过 _slice_for 的动态决策。
-
-        _slice_for 依赖 self.ready_decodes / cloud_suggest_slicing 等 DP 本地
-        队列状态，DP1 复刻时这些状态可能与 DP0 执行时不同，导致切片数量不一致。
-        该方法直接使用 d_slices 反推 total_slices，确保 DP1 与 DP0 产生相同的
-        _active_prefill_slices 变化。
-        """
-        so = self.ready_prefills.popleft()
-        if d_slices > 0:
-            slices = self._do_slice(so, total_slices=d_slices + 1)
-            batch = self._gen_batch_by_slices(so, slices)
-        else:
-            batch = ScheduledBatch(scheduler_output=so, slices=[None])
-        self._log_picked_batch(batch)
-        return batch
-
-    def _replay_by_deltas(
-        self,
-        d_prefills: int,
-        d_decodes: int,
-        d_pdmixes: int,
-        d_slices: int,
-    ) -> ScheduledBatch:
-        """非 DP0：根据 DP0 的队列差值复刻操作。
-
-        total_slices 通过 d_slices 反推（d_slices + 1），无需单独传输。
-        """
-        if d_slices == -1:
-            return self._build_active_prefill_slice_batch()
-        elif d_prefills == -1:
-            return self._replay_prefill_with_slices(d_slices)
-        elif d_decodes == -1:
-            return self._build_batch(
-                self.ready_decodes.popleft(),
-            )
-        elif d_pdmixes == -1:
-            return self._build_batch(
-                self.ready_pdmixes.popleft(),
-            )
-        else:
-            return ScheduledBatch.empty()
-
-    # ------------------------------------------------------------------ #
-    # Alternative dispatch helpers                                       #
-    # ------------------------------------------------------------------ #
-
-    def _gen_batch_by_slices(
-        self, so: SchedulerOutput, slices: list,
-    ) -> ScheduledBatch:
-        """从 so + slices 列表构建 ScheduledBatch。
-
-        当 len(slices) > 1 时，第一个 slice 作为本次 batch，
-        其余转为 SliceTask 追加到 _active_prefill_slices。
-        """
-        if len(slices) <= 1:
-            return ScheduledBatch(scheduler_output=so, slices=slices)
-
-        first_slice = slices[0]
-        assert isinstance(first_slice, LayerSliceInfo)
-        self._active_sliced_prefill = so
-        self._active_prefill_slices.extend(
-            SliceTask(so, slice_info)
-            for slice_info in slices[1:]
-            if isinstance(slice_info, LayerSliceInfo)
-        )
-        return ScheduledBatch(scheduler_output=so, slices=[first_slice])
-
     def _schedule_from_queue(self, queue_name: str) -> ScheduledBatch:
         if self._active_prefill_slices:
             if queue_name == "ready_decodes" and self.ready_decodes:
@@ -1241,11 +838,21 @@ class PassiveScheduler:
             return self._build_batch(q.popleft())
         return ScheduledBatch.empty()
 
-    def _build_batch(
-        self, so: SchedulerOutput, total_slices: Optional[int] = None,
-    ) -> ScheduledBatch:
-        slices = self._slice_for(so, total_slices)
-        batch = self._gen_batch_by_slices(so, slices)
+    def _build_batch(self, so: SchedulerOutput) -> ScheduledBatch:
+        slices = self._slice_for(so)
+        if len(slices) <= 1:
+            batch = ScheduledBatch(scheduler_output=so, slices=slices)
+        else:
+            first_slice = slices[0]
+            assert isinstance(first_slice, LayerSliceInfo)
+            self._active_sliced_prefill = so
+            self._active_prefill_slices.extend(
+                SliceTask(so, slice_info)
+                for slice_info in slices[1:]
+                if isinstance(slice_info, LayerSliceInfo)
+            )
+            batch = ScheduledBatch(scheduler_output=so, slices=[first_slice])
+
         self._log_picked_batch(batch)
         return batch
 
