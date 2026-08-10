@@ -1,3 +1,4 @@
+import logging
 import math
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -21,6 +22,8 @@ from vllm_ascend.utils import (
     is_moe_model,
     speculative_enable_dispatch_gmm_combine_decode,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MoECommType(Enum):
@@ -266,19 +269,44 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         "moe_quantize",
         getattr(vllm_config.model_config.hf_text_config, "quantize", None),
     )
+    ep_world_size_v = get_ep_group().world_size
+    enable_ep_v = vllm_config.parallel_config.enable_expert_parallel
 
-    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+    if not enable_ep_v or ep_world_size_v == 1:
         moe_comm_type = MoECommType.ALLGATHER
+        logger.error(
+            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s enable_ep=%s ep_world_size=%s "
+            "soc=%s => ALLGATHER (no_ep=%s ep_size_1=%s)",
+            num_tokens, enable_ep_v, ep_world_size_v, soc_version,
+            (not enable_ep_v), (ep_world_size_v == 1),
+        )
     elif soc_version in {AscendDeviceType.A2}:
         num_experts = vllm_config.model_config.get_num_experts()
-        ep_world_size = (
-            vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
-        )
+        world_size_across_dp_v = vllm_config.parallel_config.world_size_across_dp
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        edge_cloud_cfg = get_ascend_config().edge_cloud_config
+        if edge_cloud_cfg is not None and edge_cloud_cfg.enabled:
+            # 边云: EP group 按边/云分组(全 MoE 下边侧 head/tail 也有 expert),用
+            # per-rank 真实 EP (ep_world_size_v = get_ep_group().world_size) -> 云侧 16 /
+            # 边侧 2。world_size_across_dp(=18,非16非2)与 //pp_size(=9,两边都不对)
+            # 都不能正确反映边云非对称 PP 下的 per-rank EP。云 16>=16 走 MC2,边 2<16 走 ALLGATHER。
+            ep_world_size = ep_world_size_v
+        else:
+            # 非边云: 保持原有逻辑不动(EP group 在 PP stage 内,大小 = world*dp/pp)。
+            # 不改用 get_ep_group().world_size:world_size 含 PCP/CP 因子,PCP>1 等场景下
+            # 两者可能不等,保持原公式以避免对已验证场景产生任何影响。
+            ep_world_size = world_size_across_dp_v // pp_size
         num_experts_per_device = num_experts // ep_world_size
         if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLGATHER
+        logger.error(
+            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s soc=A2 ep_world=%s "
+            "experts/dev=%s => %s",
+            num_tokens, ep_world_size, num_experts_per_device,
+            moe_comm_type.name,
+        )
 
     elif soc_version in {AscendDeviceType.A3}:
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
@@ -303,8 +331,19 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             elif fused_mc2_enable == 2:
                 fused_prefill_enable = False
             moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
+        logger.error(
+            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s enable_ep=%s ep_world_size=%s "
+            "soc=A3 fused_mc2=%s dispatch_enable=%s (decode=%s) => %s",
+            num_tokens, enable_ep_v, ep_world_size_v,
+            fused_mc2_enable, dispatch_ffn_combine_enable,
+            (num_tokens <= mc2_tokens_capacity), moe_comm_type.name,
+        )
     elif soc_version in {AscendDeviceType._310P}:
         moe_comm_type = MoECommType.ALLGATHER
+        logger.error(
+            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s soc=310P => ALLGATHER",
+            num_tokens,
+        )
     elif soc_version in {AscendDeviceType.A5}:
         num_experts_per_tok = vllm_config.model_config.hf_text_config.num_experts_per_tok
         world_size = vllm_config.parallel_config.world_size_across_dp
@@ -314,6 +353,10 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.ALLGATHER
         else:
             moe_comm_type = MoECommType.ALLTOALL
+        logger.error(
+            "[EC-PERF][MOE-COMM-SELECT] num_tokens=%s soc=A5 => %s",
+            num_tokens, moe_comm_type.name,
+        )
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
     return moe_comm_type
