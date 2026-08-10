@@ -879,6 +879,11 @@ class NPUModelRunner(GPUModelRunner):
         # Saved in execute_model() so sample_tokens() can access scheduler_output
         # for edge-cloud mamba state sync (especially on the cloud side).
         self._last_scheduler_output: "SchedulerOutput | None" = None
+        # True only while the parent target-model graph capture loop is
+        # running, including its per-shape eager warmups. Edge-cloud drafters
+        # that actually run eagerly are profiled before this phase and must not
+        # perform cross-node dummy communication from inside target capture.
+        self._edge_cloud_target_capture_in_progress = False
 
         # Latest cloud-side target metadata for draft paths that do not cross
         # an independent scheduling boundary.
@@ -909,7 +914,7 @@ class NPUModelRunner(GPUModelRunner):
             str, CloudDraftPositionState
         ] = {}
         self._eagle3_cloud_aux_hidden_states_by_task: dict[
-            str, torch.Tensor
+            str, torch.Tensor | list[torch.Tensor]
         ] = {}
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
@@ -1039,7 +1044,9 @@ class NPUModelRunner(GPUModelRunner):
         # Cloud-side cache for EAGLE3 aux hidden states produced by the target
         # model's cloud segment. These hidden states are consumed by the draft
         # model's cloud segment without crossing the edge-cloud boundary.
-        self._eagle3_cloud_aux_hidden_states: torch.Tensor | None = None
+        self._eagle3_cloud_aux_hidden_states: (
+            torch.Tensor | list[torch.Tensor] | None
+        ) = None
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1183,7 +1190,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         segment: Any,
         intermediate_tensors: IntermediateTensors,
-        aux_hidden_states: torch.Tensor | None,
+        aux_hidden_states: torch.Tensor | list[torch.Tensor] | None,
         num_tokens: int,
         is_first_step: bool,
     ) -> None:
@@ -1193,6 +1200,9 @@ class NPUModelRunner(GPUModelRunner):
         itself must have one static execution path so that ACL graph replay does
         not reuse the first-step fusion branch for later speculative steps.
         """
+        aux_hidden_states = self._combine_eagle3_cloud_aux_hidden_states(
+            aux_hidden_states
+        )
         if aux_hidden_states is None:
             if is_first_step:
                 raise RuntimeError(
@@ -1224,6 +1234,132 @@ class NPUModelRunner(GPUModelRunner):
                 f"fusion result: {hidden_states.shape} vs {fused_hidden_states.shape}"
             )
             hidden_states.copy_(fused_hidden_states)
+
+    @staticmethod
+    def _combine_eagle3_cloud_aux_hidden_states(
+        aux_hidden_states: torch.Tensor | list[torch.Tensor] | None,
+    ) -> torch.Tensor | None:
+        """Combine retained layer-slice outputs when the draft consumes them."""
+        if aux_hidden_states is None or torch.is_tensor(aux_hidden_states):
+            return aux_hidden_states
+        if not isinstance(aux_hidden_states, list):
+            raise RuntimeError(
+                "EAGLE3 cloud aux_hidden_states must be a tensor or tensor "
+                f"list, got {type(aux_hidden_states).__name__}"
+            )
+        if not aux_hidden_states:
+            return None
+
+        first = aux_hidden_states[0]
+        if not torch.is_tensor(first):
+            raise RuntimeError(
+                "EAGLE3 cloud aux_hidden_states list must contain tensors"
+            )
+        for current in aux_hidden_states[1:]:
+            if not torch.is_tensor(current):
+                raise RuntimeError(
+                    "EAGLE3 cloud aux_hidden_states list must contain tensors"
+                )
+            if (
+                first.ndim != current.ndim
+                or first.shape[:-1] != current.shape[:-1]
+            ):
+                raise RuntimeError(
+                    "EAGLE3 cloud layer slices produced incompatible auxiliary "
+                    f"hidden-state shapes: {first.shape} vs {current.shape}"
+                )
+        if len(aux_hidden_states) == 1:
+            return first
+        return torch.cat(aux_hidden_states, dim=-1)
+
+    def _cache_eagle3_cloud_aux_hidden_states(
+        self,
+        aux_hidden_states: torch.Tensor | None,
+        layer_slice_info: Any,
+    ) -> None:
+        """Retain target auxiliary states for the matching cloud draft.
+
+        Sliced prefill uses the raw cloud segment, whose outputs are fresh
+        eager tensors. Retain each part without launching clone/cat kernels;
+        the draft combines them only when step 0 consumes the target states.
+        Continuation slices use ``_layerwise_scheduler_output`` because an
+        interleaved decode may have replaced ``_last_scheduler_output``.
+        """
+        if (
+            self.speculative_config is None
+            or self.speculative_config.method != "eagle3"
+        ):
+            self._eagle3_cloud_aux_hidden_states = None
+            return
+
+        is_first_slice = (
+            layer_slice_info is None or layer_slice_info.is_first_slice
+        )
+        scheduler_output = (
+            self._layerwise_scheduler_output
+            if layer_slice_info is not None
+            else self._last_scheduler_output
+        )
+        task_id = (
+            scheduler_output.head_token
+            if scheduler_output is not None
+            else None
+        )
+        use_task_cache = bool(
+            self._uses_scheduled_edge_cloud_draft()
+            and task_id is not None
+        )
+
+        if layer_slice_info is not None:
+            if aux_hidden_states is not None and not torch.is_tensor(
+                aux_hidden_states
+            ):
+                raise RuntimeError(
+                    "EAGLE3 cloud aux_hidden_states must be a tensor, got "
+                    f"{type(aux_hidden_states).__name__}"
+                )
+
+            if use_task_cache:
+                assert task_id is not None
+                cached = self._eagle3_cloud_aux_hidden_states_by_task.get(
+                    task_id
+                )
+                parts = (
+                    []
+                    if is_first_slice or not isinstance(cached, list)
+                    else cached
+                )
+            else:
+                cached = self._eagle3_cloud_aux_hidden_states
+                parts = (
+                    []
+                    if is_first_slice or not isinstance(cached, list)
+                    else cached
+                )
+
+            if aux_hidden_states is not None:
+                parts.append(aux_hidden_states)
+            self._eagle3_cloud_aux_hidden_states = parts
+            if use_task_cache:
+                self._eagle3_cloud_aux_hidden_states_by_task[task_id] = parts
+            return
+
+        # Non-sliced target execution may use ACL graph replay, whose output
+        # buffers are reused. Keep the existing clone behavior for that path.
+        frozen_aux_hidden_states = (
+            _freeze_scheduled_state(aux_hidden_states)
+            if aux_hidden_states is not None
+            else None
+        )
+        self._eagle3_cloud_aux_hidden_states = frozen_aux_hidden_states
+        if use_task_cache:
+            assert task_id is not None
+            if frozen_aux_hidden_states is None:
+                self._eagle3_cloud_aux_hidden_states_by_task.pop(task_id, None)
+            else:
+                self._eagle3_cloud_aux_hidden_states_by_task[task_id] = (
+                    frozen_aux_hidden_states
+                )
 
     def _load_model_edge_cloud(self) -> None:
         """边云场景的模型加载流程（复用 vLLM 标准 PP 初始化，直接加载到 NPU）。
@@ -4945,9 +5081,13 @@ class NPUModelRunner(GPUModelRunner):
             self._cloud_draft_position_state_by_task.pop(
                 stale_task_id, None
             )
-            self._eagle3_cloud_aux_hidden_states_by_task.pop(
-                stale_task_id, None
+            stale_aux_hidden_states = (
+                self._eagle3_cloud_aux_hidden_states_by_task.pop(
+                    stale_task_id, None
+                )
             )
+            if self._eagle3_cloud_aux_hidden_states is stale_aux_hidden_states:
+                self._eagle3_cloud_aux_hidden_states = None
             logger.warning(
                 "Cloud draft metadata cache exceeded bound (%d); evicting "
                 "unconsumed task_id=%s",
@@ -5527,9 +5667,16 @@ class NPUModelRunner(GPUModelRunner):
             self._cloud_draft_position_state_by_task.pop(
                 scheduler_output.draft_task_id, None
             )
-            self._eagle3_cloud_aux_hidden_states_by_task.pop(
-                scheduler_output.draft_task_id, None
+            consumed_aux_hidden_states = (
+                self._eagle3_cloud_aux_hidden_states_by_task.pop(
+                    scheduler_output.draft_task_id, None
+                )
             )
+            if (
+                self._eagle3_cloud_aux_hidden_states
+                is consumed_aux_hidden_states
+            ):
+                self._eagle3_cloud_aux_hidden_states = None
         return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -6342,6 +6489,22 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
+    @staticmethod
+    def _unwrap_layerwise_aux_hidden_state_output(
+        hidden_states: Any,
+    ) -> Any:
+        """Return the primary hidden states from a layerwise model output.
+
+        A final local model segment may return the usual
+        ``(hidden_states, aux_hidden_states)`` pair when Eagle3 auxiliary
+        outputs are enabled. Non-final layer slices and edge-cloud cloud
+        segments instead return ``IntermediateTensors`` and must stay intact
+        for the following slice or edge segment.
+        """
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states, _ = hidden_states
+        return hidden_states
+
     def _execute_layerwise_continuation(
         self,
         layer_slice_info: Any,
@@ -6424,7 +6587,9 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("layerwise post process"):
             if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = hidden_states
+                hidden_states = self._unwrap_layerwise_aux_hidden_state_output(
+                    hidden_states
+                )
             if self.pcp_size > 1:
                 hidden_states = self.pcp_manager.get_restore_hidden_states(
                     hidden_states
@@ -6680,19 +6845,11 @@ class NPUModelRunner(GPUModelRunner):
         # cloud side and remove them from the tensors sent back to the edge.
         # Build a new IntermediateTensors instead of mutating the returned one,
         # because the returned object may be reused by ACL graph replay.
-        if "aux_hidden_states" in hidden_states.tensors:
-            aux_hidden_states = hidden_states.tensors["aux_hidden_states"]
-            self._eagle3_cloud_aux_hidden_states = aux_hidden_states
-            scheduler_output = self._last_scheduler_output
-            if (
-                self._uses_scheduled_edge_cloud_draft()
-                and self.speculative_config.method == "eagle3"
-                and scheduler_output is not None
-                and scheduler_output.head_token is not None
-            ):
-                self._eagle3_cloud_aux_hidden_states_by_task[
-                    scheduler_output.head_token
-                ] = _freeze_scheduled_state(aux_hidden_states)
+        aux_hidden_states = hidden_states.tensors.get("aux_hidden_states")
+        self._cache_eagle3_cloud_aux_hidden_states(
+            aux_hidden_states, layer_slice_info
+        )
+        if aux_hidden_states is not None:
             return IntermediateTensors(
                 {
                     k: v
@@ -6700,7 +6857,6 @@ class NPUModelRunner(GPUModelRunner):
                     if k != "aux_hidden_states"
                 }
             )
-        self._eagle3_cloud_aux_hidden_states = None
         return hidden_states
 
     def _pad_for_sequence_parallelism(
@@ -7669,6 +7825,18 @@ class NPUModelRunner(GPUModelRunner):
                     _peer_bt, _skip_head, _skip_tail,
                 )
 
+            is_scheduled_edge_cloud_draft = (
+                self._edge_cloud_enabled
+                and self.speculative_config is not None
+                and self.speculative_config.method in ("mtp", "eagle3")
+            )
+            skip_eager_edge_cloud_drafter = (
+                self._edge_cloud_target_capture_in_progress
+                and is_scheduled_edge_cloud_draft
+                and self.drafter is not None
+                and not self.drafter.use_cuda_graph
+            )
+
             if not _skip_head:
                 with set_ascend_forward_context(
                     attn_metadata,
@@ -7749,7 +7917,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 dummy_compute_logits(hidden_states)
 
-                if self.drafter:
+                if self.drafter and not skip_eager_edge_cloud_drafter:
                     self.drafter.dummy_run(
                         num_tokens=num_tokens_padded,
                         with_prefill=with_prefill,
@@ -7760,6 +7928,12 @@ class NPUModelRunner(GPUModelRunner):
                         dummy_compute_logits=dummy_drafter_compute_logits,
                         in_graph_capturing=not force_attention,
                         is_profile=is_profile,
+                    )
+                elif skip_eager_edge_cloud_drafter:
+                    logger.info_once(
+                        "[EdgeCloud][GraphCapture] Skipping eager %s drafter "
+                        "dummy run during target graph capture.",
+                        self.speculative_config.method,
                     )
                 if is_profile and self.dynamic_eplb:
                     target = self.model.language_model if hasattr(self.model, "language_model") else self.model
@@ -8026,26 +8200,36 @@ class NPUModelRunner(GPUModelRunner):
             self.need_accepted_tokens = False
             self.may_reinitialize_input_batch(kv_cache_config)
             self.kv_cache = {}
-            # Initialize cudagraph dispatcher keys + ACL graph params ONLY for the
-            # MTP edge-cloud path. The MTP drafter segments (_edge_cloud_mtp_segments)
-            # rely on graph_params being set here; without it ACL graph capture/replay
-            # hangs. (Mirrors the `method == "mtp"` guard in _check_and_update_cudagraph_mode.)
+            # A scheduled edge-cloud draft participates in the parent capture
+            # loop only when the loaded drafter actually uses ACL graphs. In
+            # that case the edge needs the same dispatcher keys and graph params
+            # as the cloud so their per-shape draft dummy communication stays
+            # aligned.
             #
-            # DO NOT run this for the non-MTP embedding_only edge. Passing empty
-            # attention backends leaves min_cg_support at ALWAYS, which initializes
-            # the dispatcher keys (keys_initialized=True) and makes dispatch() return
-            # FULL instead of NONE. That flips the edge decode tail (segment_e) from
-            # eager into ACL-graph capture/replay and adds a per-step
-            # update_full_graph_params sync, costing ~2% throughput (94 -> 92 token/s)
-            # and hurting the edge/cloud overlap under --async-scheduling. The edge
-            # tail has no attention layers, so eager is both correct and faster here
-            # -- this is exactly the pre-MTP behavior.
+            # Do not initialize these keys for an eager drafter. Its normal
+            # profile_run has already executed before target capture, and
+            # _dummy_run skips it while target capture is in progress. Keeping
+            # the dispatcher uninitialized also leaves the otherwise-empty
+            # embedding_only edge target segments on the eager path.
             if (
                 self.speculative_config is not None
-                and self.speculative_config.method == "mtp"
+                and self.speculative_config.method in ("mtp", "eagle3")
+                and self.drafter is not None
+                and self.drafter.use_cuda_graph
             ):
                 self._check_and_update_cudagraph_mode(
                     [], kv_cache_config.kv_cache_groups
+                )
+                capture_sizes = sorted({
+                    desc.num_tokens
+                    for _, descs in self.cudagraph_dispatcher.get_capture_descs()
+                    for desc in descs
+                })
+                logger.info(
+                    "[EdgeCloud][GraphCapture] embedding_only edge initialized "
+                    "graph-backed %s draft participation for sizes=%s",
+                    self.speculative_config.method,
+                    capture_sizes,
                 )
             logger.info(
                 "[EdgeCloud] embedding_only edge skipped KV cache tensor "
@@ -9193,9 +9377,14 @@ class NPUModelRunner(GPUModelRunner):
         # 因此这里手动清空，强制重新 capture。
         for wrapper in self._get_aclgraph_wrappers():
             wrapper.concrete_aclgraph_entries.clear()
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            result = GPUModelRunner.capture_model(self)
-        return result
+        self._edge_cloud_target_capture_in_progress = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
+                parent_module_name
+            ):
+                return GPUModelRunner.capture_model(self)
+        finally:
+            self._edge_cloud_target_capture_in_progress = False
 
     def _prepare_multimodal_fields(self):
         """
