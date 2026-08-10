@@ -266,6 +266,7 @@ class ExecuteModelState(NamedTuple):
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None
     hidden_states: torch.Tensor
+    mtp_target_hidden_states: torch.Tensor | None
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
     attn_metadata: "PerLayerAttnMetadata"
@@ -2949,12 +2950,39 @@ class NPUModelRunner(GPUModelRunner):
             )
         )
 
+    def _snapshot_mtp_target_hidden_states(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> torch.Tensor | None:
+        """Freeze this target batch's pre-HC state before sampling.
+
+        DeepSeek-V4 updates one persistent pre-HC buffer from inside the
+        target forward. Sampling is a separate worker phase, so retaining a
+        per-execution clone here prevents a later graph/batch from reusing the
+        shared storage before the deferred draft context is assembled.
+        """
+        if not self._should_defer_edge_cloud_draft(scheduler_output):
+            return None
+        mtp_hidden_states = getattr(
+            self.get_model(),
+            "get_mtp_target_hidden_states",
+            lambda: None,
+        )()
+        if mtp_hidden_states is None:
+            return None
+        scheduled_token_count = sum(
+            int(token_count)
+            for token_count in scheduler_output.num_scheduled_tokens.values()
+        )
+        return mtp_hidden_states[:scheduled_token_count].clone()
+
     def _stash_pending_edge_cloud_draft_context(
         self,
         scheduler_output: "SchedulerOutput",
         sampled_token_ids: torch.Tensor | list[list[int]],
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        mtp_target_hidden_states: torch.Tensor | None,
     ) -> None:
         if scheduler_output.head_token is None:
             raise RuntimeError(
@@ -2988,16 +3016,12 @@ class NPUModelRunner(GPUModelRunner):
         # a capture boundary (e.g. 16 -> 15 requests).
         scheduled_token_count = sum(num_scheduled)
         draft_positions = positions[:scheduled_token_count].clone()
-        mtp_hidden_states = getattr(
-            self.get_model(),
-            "get_mtp_target_hidden_states",
-            lambda: None,
-        )()
-        if mtp_hidden_states is not None:
-            hidden_states = mtp_hidden_states
-        # The draft needs the target hidden states of every scheduled token
-        # (sample_hidden_states only covers the logits rows).
-        draft_hidden_states = hidden_states[:scheduled_token_count].clone()
+        if mtp_target_hidden_states is not None:
+            draft_hidden_states = mtp_target_hidden_states
+        else:
+            # The draft needs the target hidden states of every scheduled
+            # token (sample_hidden_states only covers the logits rows).
+            draft_hidden_states = hidden_states[:scheduled_token_count].clone()
 
         # Snapshot the scheduled token ids so the first draft step can build
         # the shifted input ids (target ids shifted left by one, closed by
@@ -4398,6 +4422,7 @@ class NPUModelRunner(GPUModelRunner):
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
                 hidden_states,
+                self._snapshot_mtp_target_hidden_states(scheduler_output),
                 sample_hidden_states,
                 aux_hidden_states,
                 attn_metadata,
@@ -4559,6 +4584,7 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
+            mtp_target_hidden_states,
             sample_hidden_states,
             aux_hidden_states,
             attn_metadata,
@@ -4726,6 +4752,7 @@ class NPUModelRunner(GPUModelRunner):
                         sampled_token_ids,
                         positions,
                         hidden_states,
+                        mtp_target_hidden_states,
                     )
                 elif use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
@@ -6448,6 +6475,9 @@ class NPUModelRunner(GPUModelRunner):
                 self._layerwise_spec_decode_metadata,
                 self._layerwise_spec_decode_common_attn_metadata,
                 hidden_states,
+                self._snapshot_mtp_target_hidden_states(
+                    self._layerwise_scheduler_output
+                ),
                 sample_hidden_states,
                 None,   # aux_hidden_states
                 self._layerwise_attn_metadata,
